@@ -19,12 +19,14 @@ uses to actually move funds within those rules.
 
 ## In plain terms
 
-- **You** create a BVCC Agent Wallet in the dashboard and set the rules (e.g.
-  "this agent can spend up to 5 USDC/day, only USDC and ETH, can swap on Uniswap").
-- **Your agent** gets a key. With this SDK it can send, swap, and check balances —
-  but every action is checked against your rules automatically.
-- If the agent tries something outside the rules, the action simply **fails** —
-  no funds move. You stay in control.
+- **You** create a BVCC Agent Wallet and authorize an agent in the dashboard: you
+  paste the agent's **public address** and set its rules (e.g. "up to 5 USDC/day,
+  only USDC and ETH, may swap on Uniswap"), then sign with Face ID.
+- **The agent** has its own keypair — you generate it; BVCC never issues or sees
+  it. With its key and this SDK it can send, swap, and check balances, and every
+  action is checked against your rules automatically.
+- If it tries something outside the rules, the action simply **fails** — no funds
+  move. You stay in control.
 
 ### What your agent can do with it
 
@@ -45,11 +47,22 @@ npm install @bvcc/agent-sdk viem
 
 **2. Give it your two values**
 
-You need two things from the BVCC dashboard:
+You need two things:
 
-- **Agent key** — the secret key for the agent you authorized (keep it in an `.env`
-  file, never share it).
-- **Wallet address** — the address of your BVCC Agent Wallet (starts with `0x`).
+- **Wallet address** — your BVCC Agent Wallet address, from the dashboard (starts
+  with `0x`).
+- **Agent key** — the *private key* of the agent you authorized. You create this
+  keypair yourself, authorize its **public address** in the dashboard, and keep the
+  private key secret in an `.env` file. BVCC never issues or sees it.
+
+> First time? Generate an agent keypair, then authorize the printed address in the
+> dashboard:
+> ```ts
+> import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
+> const key = generatePrivateKey();
+> console.log("Authorize this address in the dashboard:", privateKeyToAccount(key).address);
+> console.log("Save this as AGENT_PRIVATE_KEY (keep it secret):", key);
+> ```
 
 ```ts
 import { BvccAgentClient, parseEther } from "@bvcc/agent-sdk";
