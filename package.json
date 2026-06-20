@@ -1,0 +1,51 @@
+{
+  "name": "@bvcc/agent-sdk",
+  "version": "0.2.0",
+  "description": "TypeScript SDK for operating a BVCC Agent Wallet from an off-chain AI agent. On-chain spending limits, no private-key custody by BVCC.",
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "example:send": "tsx examples/01-send-native.ts",
+    "example:token": "tsx examples/02-send-token.ts",
+    "example:limits": "tsx examples/03-read-limits.ts"
+  },
+  "keywords": [
+    "bvcc",
+    "ethereum",
+    "erc-4337",
+    "smart-wallet",
+    "ai-agent",
+    "viem",
+    "defi"
+  ],
+  "homepage": "https://bvccwallet.blockventurechaincapital.com",
+  "peerDependencies": {
+    "viem": "^2.0.0"
+  },
+  "devDependencies": {
+    "tsup": "^8.0.0",
+    "tsx": "^4.7.0",
+    "typescript": "^5.4.0",
+    "vitest": "^2.1.0",
+    "viem": "^2.21.0"
+  }
+}
