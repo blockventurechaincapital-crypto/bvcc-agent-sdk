@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/blockventurechaincapital-crypto/bvcc-agent-sdk/main/assets/bvcc_wallet.png" alt="BVCC Wallet" width="180" />
+  <img src="https://raw.githubusercontent.com/blockventurechaincapital-crypto/bvcc-agent-sdk/assets/bvcc_wallet.png" alt="BVCC Wallet" width="180" />
 </p>
 
 # @bvcc/agent-sdk
