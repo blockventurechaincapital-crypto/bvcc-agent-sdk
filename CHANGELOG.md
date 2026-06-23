@@ -4,6 +4,16 @@ All notable changes to `@bvcc/agent-sdk` are documented here. This project follo
 [Semantic Versioning](https://semver.org/). While on `0.x`, the public API may
 change between minor versions.
 
+## [0.1.2] — 2026-06-23
+
+### Changed
+- Catalog (LLM-facing layer) only: `getNativeBalance` and `getTokenBalances` now
+  return a `formatted` string that includes the token symbol (e.g. `"0.1951 USDC"`,
+  `"0.000872 ETH"`). Small models were reading the raw base-unit field and
+  misreporting balances (e.g. `195100` as "195,100 USDC"). `raw`/`decimals` are
+  unchanged, and the underlying `client.getNativeBalance()`/`getBalances()` methods
+  still return a numeric `formatted` — only the catalog wrappers add the symbol.
+
 ## [0.1.1] — 2026-06-23
 
 ### Changed

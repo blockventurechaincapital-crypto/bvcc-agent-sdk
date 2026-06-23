@@ -460,7 +460,11 @@ const getNativeBalance: Capability<Record<string, never>> = {
   summary: "The wallet's native (ETH/BNB) balance.",
   description: "Reads the Agent Wallet's native currency balance, formatted and raw.",
   params: z.object({}),
-  invoke: (client) => client.getNativeBalance(),
+  invoke: async (client) => {
+    const b = await client.getNativeBalance();
+    // formatted carries the symbol so small models don't read the raw base-unit field
+    return { ...b, formatted: `${b.formatted} ${b.symbol}` };
+  },
 };
 
 const getTokenBalances: Capability<{ tokens: string[] }> = {
@@ -474,7 +478,11 @@ const getTokenBalances: Capability<{ tokens: string[] }> = {
   params: z.object({
     tokens: z.array(zToken).min(1).describe("Token symbols or addresses to read."),
   }),
-  invoke: (client, { tokens }) => client.getBalances(tokens),
+  invoke: async (client, { tokens }) => {
+    const list = await client.getBalances(tokens);
+    // formatted carries the symbol so small models don't read the raw base-unit field
+    return list.map((b) => ({ ...b, formatted: `${b.formatted} ${b.symbol}` }));
+  },
 };
 
 const getRemaining: Capability<Record<string, never>> = {
