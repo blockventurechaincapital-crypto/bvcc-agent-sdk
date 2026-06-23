@@ -4,7 +4,13 @@ All notable changes to `@bvcc/agent-sdk` are documented here. This project follo
 [Semantic Versioning](https://semver.org/). While on `0.x`, the public API may
 change between minor versions.
 
-## [0.1.0] — Unreleased
+## [0.1.1] — 2026-06-23
+
+### Changed
+- Version aligned with `@bvcc/agent-mcp` 0.1.1. No API or behavior changes
+  (metadata only).
+
+## [0.1.0] — 2026-06-23
 
 First public release.
 
@@ -35,4 +41,5 @@ First public release.
   verified (no silent assumption that could misprice a transfer).
 - Published tarball ships no sourcemaps and excludes `.env` / examples.
 
+[0.1.1]: https://github.com/blockventurechaincapital-crypto/bvcc-agent-sdk/releases/tag/v0.1.1
 [0.1.0]: https://github.com/blockventurechaincapital-crypto/bvcc-agent-sdk/releases/tag/v0.1.0

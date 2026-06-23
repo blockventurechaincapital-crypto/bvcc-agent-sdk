@@ -1,6 +1,6 @@
 {
   "name": "@bvcc/agent-sdk",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "TypeScript SDK for operating a BVCC Agent Wallet from an off-chain AI agent. On-chain spending limits, no private-key custody by BVCC.",
   "license": "MIT",
   "type": "module",
