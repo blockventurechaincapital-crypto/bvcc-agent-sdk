@@ -79,7 +79,7 @@ export const NETWORKS: Record<number, BvccNetwork> = {
   1: {
     chainId: 1,
     name: "Ethereum",
-    rpcUrl: "https://eth.llamarpc.com",
+    rpcUrl: "https://ethereum-rpc.publicnode.com",
     agentFactory: AGENT_FACTORY,
     smartWalletFactory: SMART_FACTORY,
     entryPoint: ENTRY_POINT,

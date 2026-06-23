@@ -808,7 +808,7 @@ export class BvccAgentClient {
     if (params.quote) {
       const slippageBps = params.slippageBps ?? 50;
       try {
-        let amountOut: bigint;
+        let amountOut: bigint | null = null;
         if (params.protocol === "v3") {
           if (!this.network.quoterV2) throw new Error("no quoterV2");
           amountOut = await quoteV3ExactInputSingle(this.publicClient, this.network.quoterV2, {
@@ -818,14 +818,35 @@ export class BvccAgentClient {
             fee,
           });
         } else {
-          if (!this.network.v4Quoter) throw new Error("no v4Quoter");
-          amountOut = await quoteV4ExactInputSingle(this.publicClient, this.network.v4Quoter, {
-            tokenIn,
-            tokenOut,
-            amountIn: params.amountIn,
-            fee,
-            tickSpacing: tickSpacing ?? 60,
-          });
+          // v4: try the v4 quoter first. If its pool params (fee/tickSpacing) don't
+          // match a live pool, or it reverts, fall back to the v3 quote of the same
+          // pair as a price proxy — so a slippage bound always exists rather than
+          // leaving amountOutMinimum null (which invites a min-0, unprotected swap).
+          if (this.network.v4Quoter) {
+            try {
+              amountOut = await quoteV4ExactInputSingle(this.publicClient, this.network.v4Quoter, {
+                tokenIn,
+                tokenOut,
+                amountIn: params.amountIn,
+                fee,
+                tickSpacing: tickSpacing ?? 60,
+              });
+            } catch {
+              amountOut = null;
+            }
+          }
+          if (amountOut == null && this.network.quoterV2) {
+            amountOut = await quoteV3ExactInputSingle(this.publicClient, this.network.quoterV2, {
+              tokenIn,
+              tokenOut,
+              amountIn: params.amountIn,
+              fee,
+            });
+            warnings.push(
+              "v4 quote unavailable — amountOutMinimum derived from the v3 pool of the same pair as a price proxy. Verify it before swapping on v4.",
+            );
+          }
+          if (amountOut == null) throw new Error("no v4 or v3 quote available");
         }
         amountOutMinimum = applySlippage(amountOut, slippageBps);
       } catch {

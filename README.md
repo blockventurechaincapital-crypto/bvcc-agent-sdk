@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="https://raw.githubusercontent.com/blockventurechaincapital-crypto/bvcc-agent-sdk/main/assets/bvcc_wallet.png" alt="BVCC Wallet" width="180" />
+</p>
+
 # @bvcc/agent-sdk
 
 **Give your AI agent a wallet it can use on its own — inside spending limits you
@@ -172,7 +176,7 @@ const tokens = await agent.getBalances(["USDC", "WETH"]); // names or addresses
 const left   = await agent.getRemaining();     // how much of each limit is left
 ```
 
-Runnable scripts for all of the above live in [`examples/`](./examples) (01–13).
+Runnable scripts for all of the above live in [`examples/`](https://github.com/blockventurechaincapital-crypto/bvcc-agent-sdk/tree/main/examples) (01–13).
 
 ---
 
@@ -299,12 +303,14 @@ verified; elsewhere pass them explicitly.
 The wallet charges the BVCC agent fee (0.15%) automatically on-chain — you don't
 encode it; it's separate from your budget accounting and from gas.
 
-### Migration 0.1 → 0.2
+### For AI-runtime wrappers
 
-The convenience methods (`sendNative`, `sendToken`, `approve`, `swapExactInputV3`,
-`swapViaUniversalRouter`, `swapV4ExactIn`) now return an `ActionResult` instead of
-a raw tx hash. The low-level `execute()` / `executeAndWait()` and all `build*`
-helpers are unchanged.
+The SDK ships a declarative capability catalog at the subpath
+`@bvcc/agent-sdk/catalog` — a single, explicit, Zod-typed list of the actions an AI
+runtime may invoke. Wrappers (the [`@bvcc/agent-mcp`](https://www.npmjs.com/package/@bvcc/agent-mcp)
+MCP server, and future OpenClaw / ElizaOS adapters) generate their tools from it,
+so an action is described once and every runtime gets it. Importing the core SDK
+does **not** pull in the catalog or Zod.
 
 ## License
 
