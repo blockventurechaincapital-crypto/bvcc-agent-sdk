@@ -4,6 +4,13 @@ All notable changes to `@bvcc/agent-sdk` are documented here. This project follo
 [Semantic Versioning](https://semver.org/). While on `0.x`, the public API may
 change between minor versions.
 
+## [0.1.3] — 2026-06-28
+
+### Changed
+- Catalog (LLM-facing layer) only: `getAgentStatus` now returns a `suggestedAction`
+  with the onboarding URL (`https://bvccwallet.blockventurechaincapital.com`) when
+  the agent is not yet authorized, so an assistant can guide the user through setup.
+
 ## [0.1.2] — 2026-06-23
 
 ### Changed

@@ -437,6 +437,15 @@ const getAgentStatus: Capability<Record<string, never>> = {
       ...s,
       // Surface a readable expiry; raw `expiry` (unix seconds, 0 = never) kept.
       expiryHuman: s.expiry === 0n ? "never" : new Date(Number(s.expiry) * 1000).toISOString(),
+      // Onboarding: if the agent isn't authorized yet, point the user to set it up.
+      ...(s.isAuthorized
+        ? {}
+        : {
+            suggestedAction:
+              "This agent is not authorized on this wallet/chain. Create a BVCC Agent Wallet " +
+              "and authorize this agent's address at https://bvccwallet.blockventurechaincapital.com, " +
+              "then retry.",
+          }),
     };
   },
 };
