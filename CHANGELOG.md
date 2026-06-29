@@ -4,6 +4,13 @@ All notable changes to `@bvcc/agent-sdk` are documented here. This project follo
 [Semantic Versioning](https://semver.org/). While on `0.x`, the public API may
 change between minor versions.
 
+## [0.1.4] — 2026-06-29
+
+### Added
+- **Polygon** (chain id `137`): V2 factories (same CREATE2 address as every chain),
+  Uniswap v3 `SwapRouter02` + `QuoterV2`, and WPOL as wrapped native. Token registry
+  adds WPOL, USDC (native), DAI and WBTC. Native currency is `POL`.
+
 ## [0.1.3] — 2026-06-28
 
 ### Changed

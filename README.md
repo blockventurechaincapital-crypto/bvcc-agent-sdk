@@ -74,7 +74,7 @@ import { BvccAgentClient, parseEther } from "@bvcc/agent-sdk";
 const agent = new BvccAgentClient({
   account: process.env.AGENT_PRIVATE_KEY as `0x${string}`, // the agent's secret key
   walletAddress: "0xYourWalletAddress...",                  // your Agent Wallet
-  network: 42161, // Arbitrum One. Others: 1 Ethereum, 56 BNB, 8453 Base, 421614 Arbitrum testnet
+  network: 42161, // Arbitrum One. Others: 1 Ethereum, 56 BNB, 8453 Base, 137 Polygon, 421614 Arbitrum testnet
 });
 ```
 
@@ -291,9 +291,9 @@ re-exports (`parseEther`, `formatUnits`, …).
 ### Networks, tokens & fees
 
 Factories share one address on every chain (CREATE2). Built in: Arbitrum One
-(`42161`), BNB Chain (`56`), Ethereum (`1`), Base (`8453`), Arbitrum Sepolia
-(`421614`). Pass a full `BvccNetwork` object, or just `rpcUrl`, for a custom
-endpoint.
+(`42161`), BNB Chain (`56`), Ethereum (`1`), Base (`8453`), Polygon (`137`),
+Arbitrum Sepolia (`421614`). Pass a full `BvccNetwork` object, or just `rpcUrl`,
+for a custom endpoint.
 
 The token registry (`resolveToken`, `getBalances`) holds verified addresses for
 common tokens per chain (Binance-Peg stables are 18 decimals on BNB Chain). Unknown

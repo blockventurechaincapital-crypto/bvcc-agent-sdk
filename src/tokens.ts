@@ -50,6 +50,13 @@ export const TOKENS: Record<number, Record<string, TokenInfo>> = {
     USDT: { address: "0x55d398326f99059fF775485246999027B3197955", symbol: "USDT", decimals: 18 },
     DAI: { address: "0x1AF3F329e8BE154074D8769D1FFa4eE058B1DBc3", symbol: "DAI", decimals: 18 },
   },
+  // Polygon — native token is POL; wrapped native is WPOL.
+  137: {
+    WPOL: { address: "0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270", symbol: "WPOL", decimals: 18 },
+    USDC: { address: "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359", symbol: "USDC", decimals: 6 },
+    DAI: { address: "0x8f3Cf7ad23Cd3CaDbD9735AFf958023239c6A063", symbol: "DAI", decimals: 18 },
+    WBTC: { address: "0x1BFD67037B42Cf73acF2047067bd4F2C47D9BfD6", symbol: "WBTC", decimals: 8 },
+  },
   // Arbitrum Sepolia (testnet) — only WETH is verified.
   421614: {
     WETH: { address: "0x980B62Da83eFf3D4576C647993b0c1D7faf17c73", symbol: "WETH", decimals: 18 },

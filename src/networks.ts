@@ -105,6 +105,20 @@ export const NETWORKS: Record<number, BvccNetwork> = {
     weth: "0x4200000000000000000000000000000000000006",
     quoterV2: "0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a",
   },
+  137: {
+    chainId: 137,
+    name: "Polygon",
+    rpcUrl: "https://polygon-bor-rpc.publicnode.com",
+    agentFactory: AGENT_FACTORY,
+    smartWalletFactory: SMART_FACTORY,
+    entryPoint: ENTRY_POINT,
+    currency: "POL",
+    explorer: "https://polygonscan.com",
+    swapRouter02: "0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45",
+    // universalRouter intentionally unset on Polygon — pass { router } explicitly.
+    weth: "0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270", // WPOL (wrapped native POL)
+    quoterV2: "0x61fFE014bA17989E743c5F6cB21bF9697530B21e",
+  },
   421614: {
     chainId: 421614,
     name: "Arbitrum Sepolia",
