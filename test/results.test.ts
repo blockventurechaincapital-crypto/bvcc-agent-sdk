@@ -4,8 +4,8 @@ import { ok, fail, type ActionContext } from "../src/results.js";
 const ctx: ActionContext = {
   network: "Arbitrum One",
   chainId: 42161,
-  walletAddress: "0x727D0806DFaB184eC9006af1B54d3fC3EfD801ab",
-  agentAddress: "0x38529C66F3cf22453D66B9E2A20FdF2676544aB4",
+  walletAddress: "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC",
+  agentAddress: "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
 };
 
 describe("structured results", () => {

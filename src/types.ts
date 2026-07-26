@@ -89,6 +89,18 @@ export interface AgentStatus {
 }
 
 /** What the agent can currently do, derived from its on-chain permission. */
+/** A call policy an action needs but the wallet has not registered. */
+export interface MissingPolicy {
+  /** Action this blocks, e.g. "swapV4". */
+  action: string;
+  /** Protocol the call targets. */
+  protocol: Address;
+  /** Function selector with no allowed policy. */
+  selector: `0x${string}`;
+  /** Human label for the function, e.g. "Universal Router execute". */
+  label: string;
+}
+
 export interface Capabilities {
   canSendNative: boolean;
   canSendTokens: boolean;
@@ -98,6 +110,17 @@ export interface Capabilities {
   allowedSwapTokens: readonly Address[];
   allowedProtocols: readonly Address[];
   notes: string[];
+  /**
+   * Which wallet generation this is. V3 enforces call policies on top of the
+   * permission struct; V2 does not, so the policy fields below stay empty there.
+   */
+  walletVersion?: "v2" | "v3";
+  /**
+   * Policies an action needs but that are not registered. Non-empty means the
+   * matching `can*` flag is false for a reason the permission struct alone would
+   * not reveal.
+   */
+  missingPolicies?: MissingPolicy[];
 }
 
 /** A native or ERC-20 balance, formatted for display. */

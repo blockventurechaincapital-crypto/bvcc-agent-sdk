@@ -4,6 +4,46 @@ All notable changes to `@bvcc/agent-sdk` are documented here. This project follo
 [Semantic Versioning](https://semver.org/). While on `0.x`, the public API may
 change between minor versions.
 
+## [0.2.0] — 2026-07-21
+
+### Added
+- **Wallet V3 awareness.** The SDK now understands the V3 call-policy layer, not just
+  the permission struct:
+  - `getCallPolicy` on the wallet ABI + a read-only `validatorRegistryAbi`; a new
+    `src/policy.ts` with `decodePolicy` / `describePolicy`, `detectWalletVersion`,
+    `getActiveValidator`, `wouldPassDeepValidation` and `diagnosePolicy`.
+  - `getCapabilities` now gates `canSwapV3` / `canSwapV4` on the registered policies
+    and the validator registry (not permissions alone) on V3 wallets, and returns
+    `walletVersion` + `missingPolicies`. V2 wallets are unaffected.
+  - The four V3 revert errors (`SelectorNotAllowed`, `PinnedArgMismatch`,
+    `PolicyValidationFailed`, `CalldataTooShort`) now decode to actionable messages.
+    `diagnosePolicy` distinguishes "no validator active" (do not retry) from
+    "validator rejected this calldata" (fixable).
+  - `setCallPolicy` is intentionally NOT exposed — only the wallet owner writes
+    policies, via Face ID.
+- **Aave v3** (`src/aave/`, `client.aave.*`): reads (`getAccountData`, `getPositions`,
+  `getReserves`, `maxSafeBorrow`), writes (`supply` / `withdraw` / `borrow` / `repay` /
+  `repayWithATokens` / `setCollateral` / `setEMode`) with dry-runs, and pure risk
+  calculators. Beneficiary is always pinned to the wallet; `"max"` uses
+  `type(uint256).max`. Arbitrum only for now.
+- **Aave planners** (`client.aave.plan*` / `executePlan`): chunked deleveraging,
+  closing a position, and swapping the collateral or the debt asset — no flash loans.
+  Seven controls (health-factor floor, iteration bound, strict progress, price impact
+  vs the Aave oracle, reserve state/caps/isolation/siloed, budget across the whole
+  plan, and the intermediate dip inside a swap chunk) abort with an actionable reason
+  instead of a failed transaction.
+- **Native ETH swaps** (`swapToNative` / `swapFromNative`) as BVCC's own batches via
+  SwapRouter02 + WETH, never the Universal Router's ADDRESS_THIS legs. The 0.15% agent
+  fee applies and the tool states the cost up front.
+- `nativeOut` on `swapV4` is now refused on V3 wallets before broadcasting, with a
+  pointer to `swapToNative` — the router-held output it relied on is denied on-chain.
+- Catalog: Aave and planner capabilities, plus a `module` label and `filterByModules`
+  so a wrapper can switch whole feature groups off.
+
+### Notes
+- Wallet V3 is live on Arbitrum only; on the other chains the SDK transparently
+  behaves as before (V2). Aave is Arbitrum-only in this release.
+
 ## [0.1.4] — 2026-06-29
 
 ### Added

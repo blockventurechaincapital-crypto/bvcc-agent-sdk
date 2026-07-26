@@ -27,8 +27,10 @@ import { formatUnits, isAddress, parseEther, parseUnits, type Address } from "vi
 import { z } from "zod";
 import { erc20Abi } from "./abi.js";
 import type { BvccAgentClient } from "./client.js";
-import { resolveToken } from "./tokens.js";
+import { resolveToken, NATIVE_TOKEN } from "./tokens.js";
+import { netOfFee } from "./nativeSwap.js";
 import { PERMIT2 } from "./universalRouter.js";
+import { listGuides as guideList, getGuide as guideText } from "./guides.js";
 
 /** What class of operation a capability performs. */
 export type CapabilityKind = "read" | "write" | "simulate";
@@ -47,8 +49,45 @@ export interface Capability<A = unknown> {
   description: string;
   /** Zod schema: validates the model's args AND describes them to wrappers. */
   params: z.ZodType<A>;
+  /**
+   * Feature group this belongs to. Wrappers can switch whole groups off — an
+   * operator who only wants transfers and swaps should not have to hand an agent
+   * a lending surface it will never use. Defaults to "core".
+   */
+  module?: CapabilityModule;
   /** Invoke against a live client. Returns whatever the underlying method returns. */
   invoke: (client: BvccAgentClient, args: A) => Promise<unknown>;
+}
+
+/**
+ * Feature groups a wrapper can enable or disable wholesale. `meta` is special:
+ * help/navigation (the guides) that is ALWAYS exposed, never gated by a module
+ * filter — an agent restricted to one feature must still be able to read how to
+ * use it.
+ */
+export type CapabilityModule = "core" | "aave" | "lp" | "meta";
+
+/** The user-selectable feature groups (meta is always-on, so it is not listed). */
+export const CAPABILITY_MODULES: readonly CapabilityModule[] = ["core", "aave", "lp"] as const;
+
+/**
+ * Filter the catalog down to the requested modules.
+ *
+ * Reducing what an agent can reach is a real safety lever: fewer exposed actions
+ * means fewer ways a confused or compromised agent can act, even though the
+ * contract remains the actual boundary. An unknown module name is ignored rather
+ * than throwing, so a typo degrades to a smaller surface, never a larger one.
+ */
+export function filterByModules(
+  capabilities: readonly Capability<never>[],
+  modules: readonly string[],
+): readonly Capability<never>[] {
+  const wanted = new Set(modules.map((m) => m.trim().toLowerCase()).filter(Boolean));
+  if (wanted.size === 0) return capabilities;
+  return capabilities.filter((c) => {
+    const m = c.module ?? "core";
+    return m === "meta" || wanted.has(m); // meta (help) is always exposed
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -69,6 +108,11 @@ const zAmount = z
   .string()
   .regex(/^\d+(\.\d+)?$/, "must be a positive decimal like '0.1'")
   .describe("Human-readable amount as a decimal string, e.g. '0.1'");
+
+const zTokenId = z
+  .string()
+  .regex(/^\d+$/, "must be an integer tokenId as a string")
+  .describe("Uniswap v3 position NFT id (integer as a string, e.g. '123456')");
 
 /**
  * Reject a fund-moving swap with no slippage floor. `amountOutMinimum` of 0 means
@@ -387,7 +431,10 @@ const swapV4Params = swapParams.extend({
   nativeOut: z
     .boolean()
     .optional()
-    .describe("Deliver native ETH by unwrapping WETH output. `tokenOut` must be WETH."),
+    .describe(
+      "Deliver native ETH via the v4 native (address(0)) pool — output goes straight to the wallet. " +
+        "`tokenOut` is ignored; pass the native pool's fee/tickSpacing (e.g. 500/10 for ETH/USDC 0.05%).",
+    ),
 });
 type SwapV4Args = z.infer<typeof swapV4Params>;
 
@@ -404,8 +451,12 @@ const swapV4: Capability<SwapV4Args> = {
   params: swapV4Params,
   invoke: async (client, p) => {
     const inUnits = await toBaseUnits(client, p.tokenIn, p.amountIn);
+    // Native output prices and settles on the native (address(0)) pool, not WETH —
+    // quote and floor come from that pool so slippage protection matches the swap.
+    const tokenOut = p.nativeOut ? NATIVE_TOKEN : p.tokenOut;
     const { outAddress, minRaw } = await deriveMinOut(client, "v4", {
       ...p,
+      tokenOut,
       amountInRaw: inUnits.raw,
     });
     return client.swapV4ExactIn({
@@ -437,14 +488,18 @@ const getAgentStatus: Capability<Record<string, never>> = {
       ...s,
       // Surface a readable expiry; raw `expiry` (unix seconds, 0 = never) kept.
       expiryHuman: s.expiry === 0n ? "never" : new Date(Number(s.expiry) * 1000).toISOString(),
-      // Onboarding: if the agent isn't authorized yet, point the user to set it up.
+      // Onboarding: not authorized → how to set up; authorized → point at the guides.
       ...(s.isAuthorized
-        ? {}
+        ? {
+            hint:
+              "New to this wallet? Call getGuide('getting-started') for the safe operating loop; " +
+              "listGuides shows the guides for swaps, lending and liquidity.",
+          }
         : {
             suggestedAction:
               "This agent is not authorized on this wallet/chain. Create a BVCC Agent Wallet " +
               "and authorize this agent's address at https://bvccwallet.blockventurechaincapital.com, " +
-              "then retry.",
+              "then retry. Once authorized, call getGuide('getting-started') to learn the operating loop.",
           }),
     };
   },
@@ -699,7 +754,847 @@ const dryRunSwapV4: Capability<SwapV4Args> = {
  * The full catalog. Order is stable and intentional: reads, simulations, writes.
  * Wrappers should iterate this; filter by `kind` to gate exposure.
  */
+// ---------------------------------------------------------------------------
+// Native ETH swaps (own batches via SwapRouter02 + WETH)
+// ---------------------------------------------------------------------------
+// Deliberately NOT the Universal Router's native legs: those park the output in
+// the router (ADDRESS_THIS), which the V3 validator denies because anyone could
+// sweep it. These batches keep every recipient as the wallet.
+
+const swapToNative: Capability<{
+  tokenIn: string;
+  amountOut: string;
+  amountInMaximum: string;
+  fee?: number;
+}> = {
+  id: "swapToNative",
+  kind: "write",
+  title: "Swap a token for native ETH",
+  summary: "Sell a token and receive native ETH in the wallet (one 0.15% fee).",
+  description:
+    "Atomic batch: approve → exact-output swap to WETH (recipient = wallet) → unwrap to ETH. " +
+    "Exact-output means you get precisely `amountOut` ETH with no leftover WETH dust, and only " +
+    "ONE 0.15% fee is charged. " +
+    "`amountInMaximum` is your price protection — it caps what the swap may spend. " +
+    "Note the per-token per-tx limit is consumed by that cap, not by what is actually spent, " +
+    "so the agent needs headroom of at least `amountInMaximum`. " +
+    "Requires WETH in allowedProtocols and `tokenIn` in allowedTokens.",
+  params: z.object({
+    tokenIn: zToken,
+    amountOut: zAmount.describe("Exact native ETH to receive, e.g. '0.01'"),
+    amountInMaximum: zAmount.describe("Max of tokenIn to spend — this is the price protection"),
+    fee: z.number().int().optional().describe("Pool fee tier. Default 3000."),
+  }),
+  invoke: async (client, p) => {
+    const inUnits = await toBaseUnits(client, p.tokenIn, p.amountInMaximum);
+    if (inUnits.raw <= 0n) {
+      throw new Error("amountInMaximum must be greater than 0 — it is the swap's price protection.");
+    }
+    return client.swapToNative({
+      tokenIn: inUnits.address,
+      amountOut: parseEther(p.amountOut),
+      amountInMaximum: inUnits.raw,
+      fee: p.fee,
+    });
+  },
+};
+
+const swapFromNative: Capability<{
+  tokenOut: string;
+  amountIn: string;
+  amountOutMinimum?: string;
+  slippageBps?: number;
+  fee?: number;
+}> = {
+  id: "swapFromNative",
+  kind: "write",
+  title: "Swap native ETH for a token",
+  summary: "Spend native ETH to buy a token. The 0.15% agent fee applies.",
+  description:
+    "Atomic batch: wrap ETH to WETH → approve → swap to `tokenOut` (recipient = wallet). " +
+    "The 0.15% agent fee applies. The swap is sized to the post-fee WETH automatically. " +
+    "Requires WETH in allowedProtocols and allowedTokens. " +
+    "Pass `amountOutMinimum` (exact) or `slippageBps`; one is required.",
+  params: z.object({
+    tokenOut: zToken,
+    amountIn: zAmount.describe("Native ETH to spend, e.g. '0.01'"),
+    amountOutMinimum: zAmount
+      .optional()
+      .describe("Exact minimum output in tokenOut units. Provide this OR slippageBps. '0' is refused."),
+    slippageBps: z
+      .number()
+      .int()
+      .positive()
+      .optional()
+      .describe(
+        "Slippage tolerance in basis points (50 = 0.5%). Quoted against the post-fee WETH.",
+      ),
+    fee: z.number().int().optional().describe("Pool fee tier. Default 3000."),
+  }),
+  invoke: async (client, p) => {
+    const weth = client.network.weth;
+    if (!weth) throw new Error(`No WETH address known for ${client.network.name}.`);
+    const amountInRaw = parseEther(p.amountIn);
+    // Quote against the amount that actually reaches the pool: the wrap's 0.15%
+    // fee is taken first, so quoting the gross ETH would set the floor too high.
+    const { minRaw } = await deriveMinOut(client, "v3", {
+      tokenIn: weth,
+      tokenOut: p.tokenOut,
+      amountInRaw: netOfFee(amountInRaw),
+      amountOutMinimum: p.amountOutMinimum,
+      slippageBps: p.slippageBps,
+      fee: p.fee,
+    });
+    const out = resolveToken(client.network.chainId, p.tokenOut);
+    return client.swapFromNative({
+      tokenOut: out.address,
+      amountIn: amountInRaw,
+      amountOutMinimum: minRaw,
+      fee: p.fee,
+    });
+  },
+};
+
+// ---------------------------------------------------------------------------
+// Aave v3 — lending (reads, writes, dry-runs)
+// ---------------------------------------------------------------------------
+// Writes reach the Pool through the agent's call policies, which pin the
+// beneficiary to the wallet, so none of these take a `to`/`onBehalfOf`. The Pool
+// must be in allowedProtocols; the leading approve on supply/repay is Case 2b, so
+// if a recipient whitelist is set the Pool must be in it too.
+
+const zAaveAmount = zAmount.describe('Human amount, e.g. "0.5"');
+const zAaveAmountOrMax = z
+  .union([zAmount, z.literal("max")])
+  .describe('Human amount, or "max" for the full balance/debt');
+
+const getAavePositions: Capability<Record<string, never>> = {
+  id: "getAavePositions",
+  kind: "read",
+  module: "aave",
+  title: "Aave positions & health",
+  summary: "Account health factor plus supplied/borrowed balances per reserve.",
+  description:
+    "Reads the wallet's Aave v3 account data (health factor, LTV, liquidation threshold, collateral " +
+    "and debt in USD) together with its per-reserve positions. Read-only.",
+  params: z.object({}),
+  invoke: async (client) => ({
+    account: await client.aave.getAccountData(),
+    positions: await client.aave.getPositions(),
+  }),
+};
+
+const getAaveMarket: Capability<{ assets?: string[] }> = {
+  id: "getAaveMarket",
+  kind: "read",
+  module: "aave",
+  title: "Aave market info",
+  summary: "Supply/borrow APY, LTV, liquidation params and price per reserve.",
+  description:
+    "Reads Aave v3 reserve parameters: supply and variable-borrow APY, LTV, liquidation threshold and " +
+    "bonus, active/frozen/borrowing flags, and oracle price. Pass `assets` to limit the list.",
+  params: z.object({
+    assets: z.array(zToken).optional().describe("Optional token symbols/addresses to limit to."),
+  }),
+  invoke: (client, p) => client.aave.getReserves(p.assets),
+};
+
+const aaveSupply: Capability<{ asset: string; amount: string }> = {
+  id: "aaveSupply",
+  kind: "write",
+  module: "aave",
+  title: "Supply to Aave",
+  summary: "Deposit a token into Aave v3 as collateral.",
+  description:
+    "Atomic approve + supply on the Aave v3 Pool. Deposited on behalf of the wallet (pinned by policy). " +
+    "The Pool must be in allowedProtocols and `asset` in allowedTokens; the approve counts toward the token budget.",
+  params: z.object({ asset: zToken, amount: zAaveAmount }),
+  invoke: (client, p) => client.aave.supply(p.asset, p.amount),
+};
+
+const aaveWithdraw: Capability<{ asset: string; amount: string }> = {
+  id: "aaveWithdraw",
+  kind: "write",
+  module: "aave",
+  title: "Withdraw from Aave",
+  summary: "Withdraw supplied collateral from Aave v3 back to the wallet.",
+  description:
+    'Withdraws `asset` to the wallet (pinned by policy). Pass `"max"` to withdraw the entire supplied ' +
+    "balance. The 0.15% agent fee applies to the amount received.",
+  params: z.object({ asset: zToken, amount: zAaveAmountOrMax }),
+  invoke: (client, p) => client.aave.withdraw(p.asset, p.amount),
+};
+
+const aaveBorrow: Capability<{ asset: string; amount: string }> = {
+  id: "aaveBorrow",
+  kind: "write",
+  module: "aave",
+  title: "Borrow from Aave",
+  summary: "Borrow a token from Aave v3 against supplied collateral (variable rate).",
+  description:
+    "Borrows `asset` (variable rate) to the wallet, pinned by policy. Needs sufficient collateral or it " +
+    "reverts; check getAavePositions first. The 0.15% agent fee applies to the amount received.",
+  params: z.object({ asset: zToken, amount: zAaveAmount }),
+  invoke: (client, p) => client.aave.borrow(p.asset, p.amount),
+};
+
+const aaveRepay: Capability<{ asset: string; amount: string }> = {
+  id: "aaveRepay",
+  kind: "write",
+  module: "aave",
+  title: "Repay Aave debt",
+  summary: "Repay variable-rate debt with the underlying token.",
+  description:
+    'Atomic approve + repay. Pass `"max"` to repay the full debt (approves current debt + a small ' +
+    "interest buffer). The Pool must be in allowedProtocols and in allowedRecipients if a whitelist is set.",
+  params: z.object({ asset: zToken, amount: zAaveAmountOrMax }),
+  invoke: (client, p) => client.aave.repay(p.asset, p.amount),
+};
+
+const aaveRepayWithATokens: Capability<{ asset: string; amount: string }> = {
+  id: "aaveRepayWithATokens",
+  kind: "write",
+  module: "aave",
+  title: "Repay Aave debt with aTokens",
+  summary: "Repay debt directly from supplied collateral, no underlying needed.",
+  description:
+    'Repays variable-rate debt using the wallet\'s own aTokens — no approve, no underlying transfer. ' +
+    'Pass `"max"` for the full debt. Useful for deleveraging in one step.',
+  params: z.object({ asset: zToken, amount: zAaveAmountOrMax }),
+  invoke: (client, p) => client.aave.repayWithATokens(p.asset, p.amount),
+};
+
+const aaveSetCollateral: Capability<{ asset: string; useAsCollateral: boolean }> = {
+  id: "aaveSetCollateral",
+  kind: "write",
+  module: "aave",
+  title: "Toggle Aave collateral",
+  summary: "Enable or disable a supplied asset as collateral.",
+  description:
+    "Sets whether a supplied reserve counts as collateral. Disabling collateral lowers borrowing power and " +
+    "can reduce the health factor — check getAavePositions first. Moves no funds.",
+  params: z.object({
+    asset: zToken,
+    useAsCollateral: z.boolean().describe("true = use as collateral, false = disable"),
+  }),
+  invoke: (client, p) => client.aave.setCollateral(p.asset, p.useAsCollateral),
+};
+
+const aaveSetEMode: Capability<{ categoryId: number }> = {
+  id: "aaveSetEMode",
+  kind: "write",
+  module: "aave",
+  title: "Set Aave eMode",
+  summary: "Switch the account's efficiency-mode category (0 = disabled).",
+  description:
+    "Sets the eMode category, which raises LTV/liquidation limits for correlated assets. Changing it " +
+    "shifts the risk profile of the whole position — 0 disables eMode. Moves no funds.",
+  params: z.object({
+    categoryId: z.number().int().min(0).max(255).describe("eMode category id; 0 disables"),
+  }),
+  invoke: (client, p) => client.aave.setEMode(p.categoryId),
+};
+
+// Planners. The `plan*` pair is simulate-only; the `aaveDeleverage` /
+// `aaveClosePosition` pair actually runs the loop and may send several
+// transactions in one call — the descriptions must say so plainly.
+
+const zPlannerControls = {
+  slippageBps: z
+    .number()
+    .int()
+    .positive()
+    .describe("Required. Slippage in bps for each swap leg (100 = 1%)."),
+  hfFloor: z
+    .string()
+    .optional()
+    .describe("Minimum health factor after every chunk. Default '1.05'."),
+  maximumIterations: z.number().int().positive().optional().describe("Hard cap on chunks. Default 10."),
+  maxPriceImpactBps: z
+    .number()
+    .int()
+    .positive()
+    .optional()
+    .describe("Abort if a swap prices more than this far below the Aave oracle. Default 200."),
+  minimumChunkAmount: z.string().optional().describe("Abort if the safe chunk falls below this."),
+  fee: z.number().int().optional().describe("Uniswap pool fee tier for the swap legs. Default 500."),
+};
+
+const aavePlanClosePosition: Capability<Record<string, unknown>> = {
+  id: "aavePlanClosePosition",
+  kind: "simulate",
+  module: "aave",
+  title: "Plan closing an Aave position",
+  summary: "Project how the position would be closed, without sending anything.",
+  description:
+    "Returns the route it would take and, if chunking is needed, each chunk with the health factor it " +
+    "would leave behind. Picks the cheapest viable route: repay from wallet balance if it covers the debt, " +
+    "else repay from aTokens when debt and collateral are the same asset, else a chunked deleverage loop. " +
+    "Sends nothing — use aaveClosePosition to execute.",
+  params: z.object(zPlannerControls),
+  invoke: (client, p) => client.aave.planClosePosition(p as never),
+};
+
+const aavePlanDeleverage: Capability<Record<string, unknown>> = {
+  id: "aavePlanDeleverage",
+  kind: "simulate",
+  module: "aave",
+  title: "Plan a deleverage",
+  summary: "Project selling collateral to repay debt in safe chunks, without sending anything.",
+  description:
+    "Projects the chunked loop that repays `debtAsset` by selling `collateralAsset`. Each chunk keeps the " +
+    "health factor above hfFloor. Aborts with a concrete reason (and, when the position is too tight to " +
+    "chunk, the amount of debt to repay from the wallet to unblock it). Sends nothing.",
+  params: z.object({
+    collateralAsset: zToken,
+    debtAsset: zToken,
+    amount: z.union([zAmount, z.literal("all")]).optional().describe("Debt to clear. Default 'all'."),
+    ...zPlannerControls,
+  }),
+  invoke: (client, p) => client.aave.planRepayWithCollateral(p as never),
+};
+
+const aaveClosePosition: Capability<Record<string, unknown>> = {
+  id: "aaveClosePosition",
+  kind: "write",
+  module: "aave",
+  title: "Close an Aave position",
+  summary: "Repay all debt and withdraw all collateral. MAY SEND SEVERAL TRANSACTIONS.",
+  description:
+    "Runs the plan to completion. Each chunk is re-derived from live state, re-checked against every control " +
+    "and simulated before being sent, so a single call can broadcast up to `maximumIterations` transactions. " +
+    "Returns every tx hash plus what remains. Aborts without sending if any control is violated. " +
+    "Call aavePlanClosePosition first to see what it intends to do.",
+  params: z.object(zPlannerControls),
+  invoke: (client, p) => client.aave.executePlan({ ...(p as Record<string, unknown>), kind: "closePosition" } as never),
+};
+
+const aaveDeleverage: Capability<Record<string, unknown>> = {
+  id: "aaveDeleverage",
+  kind: "write",
+  module: "aave",
+  title: "Deleverage an Aave position",
+  summary: "Sell collateral to repay debt in safe chunks. MAY SEND SEVERAL TRANSACTIONS.",
+  description:
+    "Runs the chunked loop that repays `debtAsset` by selling `collateralAsset`, keeping the health factor " +
+    "above hfFloor at every step. One call can broadcast several transactions. Returns every tx hash and the " +
+    "debt still outstanding. Call aavePlanDeleverage first to preview.",
+  params: z.object({
+    collateralAsset: zToken,
+    debtAsset: zToken,
+    amount: z.union([zAmount, z.literal("all")]).optional().describe("Debt to clear. Default 'all'."),
+    ...zPlannerControls,
+  }),
+  invoke: (client, p) => client.aave.executePlan({ ...(p as Record<string, unknown>), kind: "repayWithCollateral" } as never),
+};
+
+const aavePlanCollateralSwap: Capability<Record<string, unknown>> = {
+  id: "aavePlanCollateralSwap",
+  kind: "simulate",
+  module: "aave",
+  title: "Plan a collateral swap",
+  summary: "Project migrating the collateral backing a position to another asset. Sends nothing.",
+  description:
+    "Projects the chunked migration of collateral from `fromAsset` to `toAsset`. Each chunk withdraws, swaps " +
+    "and re-supplies, and is sized on the moment the old collateral has left but the new has not yet arrived — " +
+    "Aave checks health per operation, so that dip is the binding constraint. Note the health factor can move " +
+    "even at equal value, because assets have different liquidation thresholds. Sends nothing.",
+  params: z.object({
+    fromAsset: zToken,
+    toAsset: zToken,
+    amount: z.union([zAmount, z.literal("all")]).optional().describe("Collateral to migrate. Default 'all'."),
+    ...zPlannerControls,
+  }),
+  invoke: (client, p) => client.aave.planCollateralSwap(p as never),
+};
+
+const aavePlanDebtSwap: Capability<Record<string, unknown>> = {
+  id: "aavePlanDebtSwap",
+  kind: "simulate",
+  module: "aave",
+  title: "Plan a debt swap",
+  summary: "Project moving a debt to another asset. Sends nothing.",
+  description:
+    "Projects the chunked move of debt from `fromDebtAsset` to `toDebtAsset`. Each chunk borrows the new asset, " +
+    "swaps it and repays the old one, and is sized on the instant BOTH debts are outstanding — briefly more " +
+    "levered than the start. Expect the debt to grow slightly overall: every chunk pays two 0.15% fees plus swap " +
+    "slippage. Sends nothing.",
+  params: z.object({
+    fromDebtAsset: zToken,
+    toDebtAsset: zToken,
+    amount: z.union([zAmount, z.literal("all")]).optional().describe("Debt to move. Default 'all'."),
+    ...zPlannerControls,
+  }),
+  invoke: (client, p) => client.aave.planDebtSwap(p as never),
+};
+
+const aaveCollateralSwap: Capability<Record<string, unknown>> = {
+  id: "aaveCollateralSwap",
+  kind: "write",
+  module: "aave",
+  title: "Swap the collateral of an Aave position",
+  summary: "Migrate collateral to another asset in safe chunks. MAY SEND SEVERAL TRANSACTIONS.",
+  description:
+    "Runs the migration to completion, re-deriving and re-checking each chunk from live state. Enables the " +
+    "destination as collateral if it is not already. One call can broadcast several transactions. " +
+    "Call aavePlanCollateralSwap first to preview.",
+  params: z.object({
+    fromAsset: zToken,
+    toAsset: zToken,
+    amount: z.union([zAmount, z.literal("all")]).optional().describe("Collateral to migrate. Default 'all'."),
+    ...zPlannerControls,
+  }),
+  invoke: (client, p) =>
+    client.aave.executePlan({ ...(p as Record<string, unknown>), kind: "collateralSwap" } as never),
+};
+
+const aaveDebtSwap: Capability<Record<string, unknown>> = {
+  id: "aaveDebtSwap",
+  kind: "write",
+  module: "aave",
+  title: "Swap the debt of an Aave position",
+  summary: "Move a debt to another asset in safe chunks. MAY SEND SEVERAL TRANSACTIONS.",
+  description:
+    "Runs the debt move to completion, re-deriving and re-checking each chunk from live state. The total debt " +
+    "ends slightly higher than it started — each chunk costs two 0.15% fees plus swap slippage. One call can " +
+    "broadcast several transactions. Call aavePlanDebtSwap first to preview.",
+  params: z.object({
+    fromDebtAsset: zToken,
+    toDebtAsset: zToken,
+    amount: z.union([zAmount, z.literal("all")]).optional().describe("Debt to move. Default 'all'."),
+    ...zPlannerControls,
+  }),
+  invoke: (client, p) => client.aave.executePlan({ ...(p as Record<string, unknown>), kind: "debtSwap" } as never),
+};
+
+const dryRunAaveSupply: Capability<{ asset: string; amount: string }> = {
+  id: "dryRunAaveSupply",
+  kind: "simulate",
+  module: "aave",
+  title: "Dry-run Aave supply",
+  summary: "Simulate a supply (gas + revert reason) without sending.",
+  description: "Same inputs as aaveSupply, but only simulates.",
+  params: z.object({ asset: zToken, amount: zAaveAmount }),
+  invoke: (client, p) => client.aave.dryRunSupply(p.asset, p.amount),
+};
+
+const dryRunAaveBorrow: Capability<{ asset: string; amount: string }> = {
+  id: "dryRunAaveBorrow",
+  kind: "simulate",
+  module: "aave",
+  title: "Dry-run Aave borrow",
+  summary: "Simulate a borrow (gas + revert reason) without sending.",
+  description: "Same inputs as aaveBorrow, but only simulates — surfaces 'not enough collateral' before you send.",
+  params: z.object({ asset: zToken, amount: zAaveAmount }),
+  invoke: (client, p) => client.aave.dryRunBorrow(p.asset, p.amount),
+};
+
+// ---------------------------------------------------------------------------
+// Uniswap v3 liquidity (LP) — NonfungiblePositionManager
+// ---------------------------------------------------------------------------
+// mint/collect route to the wallet (pinned by the on-chain call policy). There is
+// no increaseLiquidity tool: the NFPM does not gate it to the owner, so it would
+// let an agent pull the wallet's approved tokens into an attacker-owned position —
+// to add liquidity, open a fresh position.
+
+const lpFeeParam = z
+  .number()
+  .int()
+  .describe("Pool fee tier: 100 (0.01%), 500 (0.05%), 3000 (0.3%) or 10000 (1%).");
+
+const addLiquidityV3: Capability<{
+  tokenA: string;
+  amountA: string;
+  tokenB: string;
+  amountB: string;
+  fee: number;
+  tickLower?: number;
+  tickUpper?: number;
+  slippageBps?: number;
+}> = {
+  id: "addLiquidityV3",
+  kind: "write",
+  module: "lp",
+  title: "Open a Uniswap v3 liquidity position",
+  summary: "Provide two ERC-20 tokens as liquidity; the position NFT is owned by the wallet.",
+  description:
+    "Atomic approve(s) + mint on the Uniswap v3 NonfungiblePositionManager. The position NFT is minted " +
+    "to the wallet (pinned by policy). `amountA`/`amountB` are the MAXIMUM you'll deposit of each token; " +
+    "the SDK reads the pool's current price and sizes the two amounts to the pool ratio (so one side is " +
+    "usually only partly used), with minimums slippageBps below the sized amounts (50 = 0.5%). Defaults to " +
+    "FULL-RANGE; pass tickLower/tickUpper (aligned to the pool's spacing) for a concentrated range. Requires " +
+    "the NFPM in allowedProtocols and both tokens in allowedTokens (the approves count toward the token " +
+    "budget). ERC-20/ERC-20 only — native ETH LP is v4.",
+  params: z.object({
+    tokenA: zToken,
+    amountA: zAmount,
+    tokenB: zToken,
+    amountB: zAmount,
+    fee: lpFeeParam,
+    tickLower: z.number().int().optional().describe("Lower tick for a concentrated range (advanced). Omit for full-range."),
+    tickUpper: z.number().int().optional().describe("Upper tick for a concentrated range (advanced). Omit for full-range."),
+    slippageBps: z.number().int().optional().describe("Slippage for the amount minimums, in bps. Default 50 (0.5%)."),
+  }),
+  invoke: async (client, p) => {
+    const a = await toBaseUnits(client, p.tokenA, p.amountA);
+    const b = await toBaseUnits(client, p.tokenB, p.amountB);
+    return client.addLiquidityV3({
+      tokenA: a.address,
+      amountA: a.raw,
+      tokenB: b.address,
+      amountB: b.raw,
+      fee: p.fee,
+      tickLower: p.tickLower,
+      tickUpper: p.tickUpper,
+      slippageBps: p.slippageBps,
+    });
+  },
+};
+
+const removeLiquidityV3: Capability<{ tokenId: string; bps?: number; burn?: boolean }> = {
+  id: "removeLiquidityV3",
+  kind: "write",
+  module: "lp",
+  title: "Remove Uniswap v3 liquidity",
+  summary: "Withdraw part or all of a position's liquidity (plus fees) to the wallet.",
+  description:
+    "decreaseLiquidity + collect in one batch, both to the wallet. `bps` is the fraction of the " +
+    "position's current liquidity to remove (10000 = all, the default). With `burn: true` a full " +
+    "removal also burns the emptied NFT. Only works on positions the wallet owns (the NFPM enforces it).",
+  params: z.object({
+    tokenId: zTokenId,
+    bps: z.number().int().min(1).max(10000).optional().describe("Fraction of liquidity to remove in bps (10000 = all). Default 10000."),
+    burn: z.boolean().optional().describe("Burn the NFT after a full removal."),
+  }),
+  invoke: (client, p) => client.removeLiquidityV3({ tokenId: BigInt(p.tokenId), bps: p.bps, burn: p.burn }),
+};
+
+const collectFeesV3: Capability<{ tokenId: string }> = {
+  id: "collectFeesV3",
+  kind: "write",
+  module: "lp",
+  title: "Collect Uniswap v3 fees",
+  summary: "Collect a position's owed fees to the wallet.",
+  description:
+    "Calls collect(recipient = wallet) on the NFPM, sweeping all owed fees to the wallet. Only the " +
+    "position owner can collect (enforced by the NFPM). No BVCC fee is charged (v3 collect calldata " +
+    "carries no token address for the fee snapshot to see).",
+  params: z.object({ tokenId: zTokenId }),
+  invoke: (client, p) => client.collectFeesV3(BigInt(p.tokenId)),
+};
+
+const burnV3: Capability<{ tokenId: string }> = {
+  id: "burnV3",
+  kind: "write",
+  module: "lp",
+  title: "Burn an empty Uniswap v3 position",
+  summary: "Burn a position NFT once its liquidity and fees are zero.",
+  description:
+    "Burns the position NFT. The NFPM requires the position to be fully removed (liquidity and owed " +
+    "fees both 0) first — use removeLiquidityV3 with burn:true to do both in one call.",
+  params: z.object({ tokenId: zTokenId }),
+  invoke: (client, p) => client.burnV3(BigInt(p.tokenId)),
+};
+
+const getV3Position: Capability<{ tokenId: string }> = {
+  id: "getV3Position",
+  kind: "read",
+  module: "lp",
+  title: "Read a Uniswap v3 position",
+  summary: "Pool tokens, fee, tick range, liquidity and owed fees for a position id.",
+  description:
+    "Reads the NFPM `positions(tokenId)` record: token0/token1, fee tier, tick range, current liquidity " +
+    "and owed fees. Read-only; use to size a removeLiquidityV3 or check what a position holds.",
+  params: z.object({ tokenId: zTokenId }),
+  invoke: async (client, p) => {
+    const pos = await client.getV3Position(BigInt(p.tokenId));
+    const [m0, m1] = await Promise.all([tokenMeta(client, pos.token0), tokenMeta(client, pos.token1)]);
+    return {
+      ...pos,
+      liquidity: pos.liquidity.toString(),
+      formatted: {
+        pair: `${m0.symbol}/${m1.symbol}`,
+        feeTier: `${pos.fee / 10000}%`,
+        range: `[${pos.tickLower}, ${pos.tickUpper}]`,
+        tokensOwed0: fmtAmount(pos.tokensOwed0, m0.decimals, m0.symbol),
+        tokensOwed1: fmtAmount(pos.tokensOwed1, m1.decimals, m1.symbol),
+      },
+    };
+  },
+};
+
+const dryRunAddLiquidityV3: Capability<{
+  tokenA: string;
+  amountA: string;
+  tokenB: string;
+  amountB: string;
+  fee: number;
+  tickLower?: number;
+  tickUpper?: number;
+  slippageBps?: number;
+}> = {
+  id: "dryRunAddLiquidityV3",
+  kind: "simulate",
+  module: "lp",
+  title: "Dry-run open v3 position",
+  summary: "Simulate opening a v3 position (gas + revert reason) without sending.",
+  description: "Same inputs as addLiquidityV3, but only simulates.",
+  params: addLiquidityV3.params,
+  invoke: async (client, p) => {
+    const a = await toBaseUnits(client, p.tokenA, p.amountA);
+    const b = await toBaseUnits(client, p.tokenB, p.amountB);
+    return enrichDryRun(
+      client,
+      await client.dryRunAddLiquidityV3({
+        tokenA: a.address,
+        amountA: a.raw,
+        tokenB: b.address,
+        amountB: b.raw,
+        fee: p.fee,
+        tickLower: p.tickLower,
+        tickUpper: p.tickUpper,
+        slippageBps: p.slippageBps,
+      }),
+    );
+  },
+};
+
+const dryRunRemoveLiquidityV3: Capability<{ tokenId: string; bps?: number; burn?: boolean }> = {
+  id: "dryRunRemoveLiquidityV3",
+  kind: "simulate",
+  module: "lp",
+  title: "Dry-run remove v3 liquidity",
+  summary: "Simulate removing v3 liquidity (gas + revert reason) without sending.",
+  description: "Same inputs as removeLiquidityV3, but only simulates.",
+  params: removeLiquidityV3.params,
+  invoke: async (client, p) =>
+    enrichDryRun(client, await client.dryRunRemoveLiquidityV3({ tokenId: BigInt(p.tokenId), bps: p.bps, burn: p.burn })),
+};
+
+// ---------------------------------------------------------------------------
+// Uniswap v4 liquidity (LP) — PositionManager modifyLiquidities
+// ---------------------------------------------------------------------------
+// This is where NATIVE-ETH LP lives (currency0 = address(0)). Recipients are pinned
+// to the wallet by the BVCCPositionManagerValidator (DEEP). It FAILS CLOSED until
+// that validator is active in the registry (48h governance) and the owner has set
+// the DEEP policy on (PositionManager, modifyLiquidities) — until then, use v3.
+// Unlike v3, v4 DOES charge the BVCC fee on collect/decrease (the pool currencies
+// are in the calldata for the fee snapshot).
+
+const NATIVE_V4: Address = "0x0000000000000000000000000000000000000000";
+
+/** Resolve a token or native ETH ("ETH"/"native"/zero address) to {address, raw}. */
+async function toV4Currency(
+  client: BvccAgentClient,
+  token: string,
+  human: string,
+): Promise<{ address: Address; raw: bigint }> {
+  const s = token.toLowerCase();
+  if (s === "eth" || s === "native" || s === NATIVE_V4) {
+    return { address: NATIVE_V4, raw: parseEther(human) };
+  }
+  return toBaseUnits(client, token, human);
+}
+
+const v4Warn = " Requires the v4 PositionManager in allowedProtocols with an ACTIVE DEEP validator; until then v4 LP fails closed — use the v3 tools.";
+
+const addLiquidityV4: Capability<{
+  tokenA: string;
+  amountA: string;
+  tokenB: string;
+  amountB: string;
+  fee: number;
+  tickSpacing?: number;
+  hooks?: string;
+  tickLower?: number;
+  tickUpper?: number;
+  slippageBps?: number;
+}> = {
+  id: "addLiquidityV4",
+  kind: "write",
+  module: "lp",
+  title: "Open a Uniswap v4 liquidity position",
+  summary: "Provide liquidity on Uniswap v4 — supports NATIVE ETH (use \"ETH\" as a token).",
+  description:
+    "Mint a v4 position via the PositionManager. Use \"ETH\" for a native side (no wrapping — v4 pools " +
+    "are native-first). `amountA`/`amountB` are the MAXIMUMS; the SDK reads the pool price and sizes the " +
+    "amounts to the ratio. Defaults to full-range; pass tickLower/tickUpper for a concentrated range. " +
+    "`hooks` defaults to none — a hooked pool only works if that hook is approved in the BVCC hook registry. " +
+    "The position and all proceeds are pinned to the wallet." + v4Warn,
+  params: z.object({
+    tokenA: zToken,
+    amountA: zAmount,
+    tokenB: zToken,
+    amountB: zAmount,
+    fee: lpFeeParam,
+    tickSpacing: z.number().int().optional().describe("v4 tick spacing. Default derived from fee (500→10, 3000→60…)."),
+    hooks: zAddress.optional().describe("Pool hook contract. Omit for a no-hook pool (must be approved otherwise)."),
+    tickLower: z.number().int().optional(),
+    tickUpper: z.number().int().optional(),
+    slippageBps: z.number().int().optional().describe("Slippage for the amount minimums, in bps. Default 50."),
+  }),
+  invoke: async (client, p) => {
+    const a = await toV4Currency(client, p.tokenA, p.amountA);
+    const b = await toV4Currency(client, p.tokenB, p.amountB);
+    return client.addLiquidityV4({
+      tokenA: a.address,
+      amountA: a.raw,
+      tokenB: b.address,
+      amountB: b.raw,
+      fee: p.fee,
+      tickSpacing: p.tickSpacing,
+      hooks: p.hooks as Address | undefined,
+      tickLower: p.tickLower,
+      tickUpper: p.tickUpper,
+      slippageBps: p.slippageBps,
+    });
+  },
+};
+
+const removeLiquidityV4: Capability<{ tokenId: string; bps?: number; burn?: boolean }> = {
+  id: "removeLiquidityV4",
+  kind: "write",
+  module: "lp",
+  title: "Remove Uniswap v4 liquidity",
+  summary: "Withdraw part or all of a v4 position (plus fees) to the wallet.",
+  description:
+    "DECREASE + TAKE_PAIR to the wallet (or BURN on a full removal with burn:true). `bps` is the fraction " +
+    "of liquidity to remove (10000 = all, default). Only the position owner can (enforced on-chain). The " +
+    "BVCC fee applies to the proceeds." + v4Warn,
+  params: z.object({
+    tokenId: zTokenId,
+    bps: z.number().int().min(1).max(10000).optional(),
+    burn: z.boolean().optional().describe("Burn the position after a full removal."),
+  }),
+  invoke: (client, p) => client.removeLiquidityV4({ tokenId: BigInt(p.tokenId), bps: p.bps, burn: p.burn }),
+};
+
+const collectFeesV4: Capability<{ tokenId: string }> = {
+  id: "collectFeesV4",
+  kind: "write",
+  module: "lp",
+  title: "Collect Uniswap v4 fees",
+  summary: "Collect a v4 position's owed fees to the wallet.",
+  description: "DECREASE(0) + TAKE_PAIR to the wallet. The BVCC fee applies to the collected amount." + v4Warn,
+  params: z.object({ tokenId: zTokenId }),
+  invoke: (client, p) => client.collectFeesV4(BigInt(p.tokenId)),
+};
+
+const burnV4: Capability<{ tokenId: string }> = {
+  id: "burnV4",
+  kind: "write",
+  module: "lp",
+  title: "Burn a Uniswap v4 position",
+  summary: "Remove all remaining liquidity and burn the position, to the wallet.",
+  description: "BURN_POSITION + TAKE_PAIR to the wallet (v4 burn auto-removes remaining liquidity)." + v4Warn,
+  params: z.object({ tokenId: zTokenId }),
+  invoke: (client, p) => client.burnV4(BigInt(p.tokenId)),
+};
+
+const getV4Position: Capability<{ tokenId: string }> = {
+  id: "getV4Position",
+  kind: "read",
+  module: "lp",
+  title: "Read a Uniswap v4 position",
+  summary: "Pool key (currencies, fee, tickSpacing, hooks) and current liquidity for a v4 position id.",
+  description: "Reads the v4 PositionManager's pool key and liquidity for a tokenId. Read-only.",
+  params: z.object({ tokenId: zTokenId }),
+  invoke: async (client, p) => {
+    const pos = await client.getV4Position(BigInt(p.tokenId));
+    return { ...pos, liquidity: pos.liquidity.toString() };
+  },
+};
+
+const dryRunAddLiquidityV4: Capability<{
+  tokenA: string;
+  amountA: string;
+  tokenB: string;
+  amountB: string;
+  fee: number;
+  tickSpacing?: number;
+  hooks?: string;
+  tickLower?: number;
+  tickUpper?: number;
+  slippageBps?: number;
+}> = {
+  id: "dryRunAddLiquidityV4",
+  kind: "simulate",
+  module: "lp",
+  title: "Dry-run open v4 position",
+  summary: "Simulate opening a v4 position (gas + revert reason) without sending.",
+  description: "Same inputs as addLiquidityV4, but only simulates. Surfaces the fail-closed revert if the v4 validator is not active yet.",
+  params: addLiquidityV4.params,
+  invoke: async (client, p) => {
+    const a = await toV4Currency(client, p.tokenA, p.amountA);
+    const b = await toV4Currency(client, p.tokenB, p.amountB);
+    return enrichDryRun(
+      client,
+      await client.dryRunAddLiquidityV4({
+        tokenA: a.address,
+        amountA: a.raw,
+        tokenB: b.address,
+        amountB: b.raw,
+        fee: p.fee,
+        tickSpacing: p.tickSpacing,
+        hooks: p.hooks as Address | undefined,
+        tickLower: p.tickLower,
+        tickUpper: p.tickUpper,
+        slippageBps: p.slippageBps,
+      }),
+    );
+  },
+};
+
+const dryRunRemoveLiquidityV4: Capability<{ tokenId: string; bps?: number; burn?: boolean }> = {
+  id: "dryRunRemoveLiquidityV4",
+  kind: "simulate",
+  module: "lp",
+  title: "Dry-run remove v4 liquidity",
+  summary: "Simulate removing v4 liquidity (gas + revert reason) without sending.",
+  description: "Same inputs as removeLiquidityV4, but only simulates.",
+  params: removeLiquidityV4.params,
+  invoke: async (client, p) =>
+    enrichDryRun(client, await client.dryRunRemoveLiquidityV4({ tokenId: BigInt(p.tokenId), bps: p.bps, burn: p.burn })),
+};
+
+// --- Guides (help; module "meta" → always exposed) -------------------------
+
+const listGuidesParams = z.object({});
+const listGuides: Capability<z.infer<typeof listGuidesParams>> = {
+  id: "listGuides",
+  kind: "read",
+  title: "List operating guides",
+  summary: "List the how-to guides (getting-started, swaps, lending, liquidity).",
+  description:
+    "Returns the available operating guides, one line each. Call getGuide with an `area` to read the " +
+    "full playbook (recommended workflow + gotchas) before your first action in an unfamiliar area. " +
+    "Pull only the area you need.",
+  module: "meta",
+  params: listGuidesParams,
+  invoke: async () => guideList(),
+};
+
+const getGuideParams = z.object({
+  area: z.enum(["getting-started", "swaps", "lending", "liquidity"]).describe("Which guide to read."),
+});
+const getGuide: Capability<z.infer<typeof getGuideParams>> = {
+  id: "getGuide",
+  kind: "read",
+  title: "Read an operating guide",
+  summary: "Read the how-to playbook for one area (getting-started | swaps | lending | liquidity).",
+  description:
+    "Returns the recommended workflow and the gotchas for one area, naming the exact tools to call. " +
+    "Read the relevant guide before your first action in an area you haven't used. " +
+    "area: getting-started | swaps | lending | liquidity.",
+  module: "meta",
+  params: getGuideParams,
+  invoke: async (_client, { area }) => guideText(area),
+};
+
 export const CATALOG: readonly Capability<never>[] = [
+  // guides (help; always exposed regardless of module filter)
+  listGuides,
+  getGuide,
   // reads
   getAgentStatus,
   getCapabilities,
@@ -713,12 +1608,53 @@ export const CATALOG: readonly Capability<never>[] = [
   dryRunSendToken,
   dryRunSwapV3,
   dryRunSwapV4,
+  // Aave reads + simulations
+  getAavePositions,
+  getAaveMarket,
+  dryRunAaveSupply,
+  dryRunAaveBorrow,
+  aavePlanClosePosition,
+  aavePlanDeleverage,
+  aavePlanCollateralSwap,
+  aavePlanDebtSwap,
+  // LP (Uniswap v3) reads + simulations
+  getV3Position,
+  dryRunAddLiquidityV3,
+  dryRunRemoveLiquidityV3,
+  // LP (Uniswap v4) reads + simulations
+  getV4Position,
+  dryRunAddLiquidityV4,
+  dryRunRemoveLiquidityV4,
   // writes
   sendNative,
   sendToken,
   approve,
   swapV3,
   swapV4,
+  swapToNative,
+  swapFromNative,
+  // Aave writes
+  aaveSupply,
+  aaveWithdraw,
+  aaveBorrow,
+  aaveRepay,
+  aaveRepayWithATokens,
+  aaveSetCollateral,
+  aaveSetEMode,
+  aaveClosePosition,
+  aaveDeleverage,
+  aaveCollateralSwap,
+  aaveDebtSwap,
+  // LP (Uniswap v3) writes
+  addLiquidityV3,
+  removeLiquidityV3,
+  collectFeesV3,
+  burnV3,
+  // LP (Uniswap v4) writes
+  addLiquidityV4,
+  removeLiquidityV4,
+  collectFeesV4,
+  burnV4,
 ] as unknown as readonly Capability<never>[];
 
 /** Look up a capability by id. */

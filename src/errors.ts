@@ -1,4 +1,4 @@
-import { toFunctionSelector } from "viem";
+import { decodeErrorResult, toFunctionSelector, type Hex } from "viem";
 
 /**
  * Human-readable decoding of contract reverts.
@@ -130,6 +130,41 @@ const ENTRIES: Entry[] = [
     humanMessage: "The recipient is not in the agent's allowedRecipients whitelist.",
     suggestedAction: "Add the recipient to allowedRecipients, or send to an allowed address.",
   },
+  // ── Wallet V3: call policies ──────────────────────────────────────────────
+  // Whitelisting a protocol is no longer enough — each (target, selector) needs a
+  // policy, and a policy can pin calldata words to the wallet. These reverts mean
+  // the policy layer stopped the call, not the permission layer.
+  {
+    name: "SelectorNotAllowed",
+    signature: "SelectorNotAllowed()",
+    humanMessage:
+      "The protocol is whitelisted, but the wallet owner has not registered a call policy for this specific function.",
+    suggestedAction:
+      "Ask the owner to add this protocol to the agent in the dashboard, which registers the required policies. Retrying the same call will not help.",
+  },
+  {
+    name: "PinnedArgMismatch",
+    signature: "PinnedArgMismatch()",
+    humanMessage:
+      "A pinned calldata argument is wrong: the policy requires that position to be the wallet itself (or a whitelisted protocol).",
+    suggestedAction:
+      "Set the recipient/onBehalfOf argument to the wallet address. Funds from an agent call must always land back in the wallet.",
+  },
+  {
+    name: "PolicyValidationFailed",
+    signature: "PolicyValidationFailed()",
+    // Two very different causes; `explainPolicyFailure` tells them apart on-chain.
+    humanMessage:
+      "Deep validation rejected this call: either no validator is active for this protocol, or the validator refused this calldata.",
+    suggestedAction:
+      "Check whether a validator is registered for the target protocol. If there is one, the calldata used an unsupported command or a recipient other than the wallet.",
+  },
+  {
+    name: "CalldataTooShort",
+    signature: "CalldataTooShort()",
+    humanMessage: "The call data is too short to contain a function selector.",
+    suggestedAction: "Build the call with a proper 4-byte selector and ABI-encoded arguments.",
+  },
 ];
 
 const bySelector = new Map<string, Entry>();
@@ -150,12 +185,39 @@ export const agentErrorAbi = ENTRIES.map((e) => ({
   inputs: [] as const,
 }));
 
-const SELECTOR_RE = /0x[0-9a-fA-F]{8}/;
+// Standard Solidity reverts, so a `require(false, "msg")` / assert is decoded to
+// its actual message instead of surfacing a bare selector (or, worse, an address
+// picked out of the error text).
+const SELECTOR_STRING_ERROR = "0x08c379a0"; // Error(string)
+const SELECTOR_PANIC = "0x4e487b71"; // Panic(uint256)
+const STANDARD_ERROR_ABI = [
+  { type: "error", name: "Error", inputs: [{ type: "string" }] },
+  { type: "error", name: "Panic", inputs: [{ type: "uint256" }] },
+] as const;
 
-function scan(error: unknown): { selector?: string; errorName?: string; raw: string } {
+// A full revert-data blob (selector + ABI args), not just a 4-byte selector.
+const DATA_RE = /^0x[0-9a-fA-F]{8,}$/;
+// A hex selector appearing *inside* free-form text (e.g. viem's message). Only
+// trusted when it maps to a KNOWN error — otherwise it may be an address/hash in
+// the message (a real bug once surfaced the agent address as the "selector").
+const EMBEDDED_HEX_RE = /0x[0-9a-fA-F]{8,}/g;
+
+interface Scan {
+  /** Authoritative revert data from a structured field (o.data / o.signature). */
+  dataHex?: string;
+  /** errorName carried by a viem error object. */
+  errorName?: string;
+  /** Hex candidates found inside message text (only used if they name a known error). */
+  embedded: string[];
+  /** First human-readable message seen. */
+  raw: string;
+}
+
+function scan(error: unknown): Scan {
   let raw = "";
-  let selector: string | undefined;
+  let dataHex: string | undefined;
   let errorName: string | undefined;
+  const embedded: string[] = [];
   const seen = new Set<unknown>();
   const stack: unknown[] = [error];
 
@@ -165,39 +227,55 @@ function scan(error: unknown): { selector?: string; errorName?: string; raw: str
     seen.add(node);
 
     if (typeof node === "string") {
-      if (!raw) raw = node;
-      const m = node.match(SELECTOR_RE);
-      if (m && !selector) selector = m[0].slice(0, 10).toLowerCase();
+      const s = node.trim();
+      if (DATA_RE.test(s)) {
+        // A bare hex blob is revert data.
+        if (!dataHex) dataHex = s.toLowerCase();
+      } else {
+        if (!raw) raw = node;
+        // Collect embedded selectors, but do not trust them yet.
+        for (const m of node.match(EMBEDDED_HEX_RE) ?? []) embedded.push(m.slice(0, 10).toLowerCase());
+      }
       continue;
     }
     if (typeof node !== "object") continue;
 
     const o = node as Record<string, unknown>;
     if (typeof o.errorName === "string" && !errorName) errorName = o.errorName;
-    if (typeof o.data === "string" && o.data.startsWith("0x") && !selector) {
-      selector = o.data.slice(0, 10).toLowerCase();
-    }
+    if (typeof o.data === "string" && DATA_RE.test(o.data) && !dataHex) dataHex = o.data.toLowerCase();
     if (o.data && typeof o.data === "object") {
       const dn = (o.data as Record<string, unknown>).errorName;
       if (typeof dn === "string" && !errorName) errorName = dn;
     }
-    if (typeof o.signature === "string" && o.signature.startsWith("0x") && !selector) {
-      selector = o.signature.slice(0, 10).toLowerCase();
+    if (typeof o.signature === "string" && DATA_RE.test(o.signature) && !dataHex) {
+      dataHex = o.signature.toLowerCase();
     }
     if (typeof o.shortMessage === "string" && !raw) raw = o.shortMessage;
 
     stack.push(o.cause, o.error, o.message, o.details, o.shortMessage);
     if (Array.isArray(o.metaMessages)) stack.push(...o.metaMessages);
   }
-  return { selector, errorName, raw };
+  return { dataHex, errorName, embedded, raw };
+}
+
+/** Decode a standard Error(string)/Panic(uint256) blob into a readable reason. */
+function decodeStandardRevert(dataHex?: string): string | undefined {
+  if (!dataHex) return undefined;
+  const sel = dataHex.slice(0, 10);
+  if (sel !== SELECTOR_STRING_ERROR && sel !== SELECTOR_PANIC) return undefined;
+  try {
+    const dec = decodeErrorResult({ abi: STANDARD_ERROR_ABI, data: dataHex as Hex });
+    if (dec.errorName === "Error") return String(dec.args?.[0] ?? "");
+    if (dec.errorName === "Panic") return `Panic(0x${(dec.args?.[0] as bigint).toString(16)})`;
+  } catch {
+    /* fall through — undecodable blob */
+  }
+  return undefined;
 }
 
 /** Keep raw error compact and free of anything sensitive. */
-function safeRaw(selector?: string, errorName?: string, raw?: string): string {
-  if (selector) return selector;
-  if (errorName) return errorName;
-  if (raw) return raw.slice(0, 160);
-  return "unknown";
+function clip(s: string): string {
+  return s.length > 160 ? s.slice(0, 160) : s;
 }
 
 /**
@@ -205,11 +283,30 @@ function safeRaw(selector?: string, errorName?: string, raw?: string): string {
  * value) into a structured, human-readable explanation.
  */
 export function decodeRevert(error: unknown): DecodedRevert {
-  const { selector, errorName, raw } = scan(error);
+  const { dataHex, errorName, embedded, raw } = scan(error);
+  const dataSelector = dataHex ? dataHex.slice(0, 10) : undefined;
 
+  // A standard string/panic revert carries the real reason (e.g. Uniswap's
+  // "Price slippage check") — surface it verbatim.
+  const reason = decodeStandardRevert(dataHex);
+  if (reason && dataSelector === SELECTOR_STRING_ERROR) {
+    const isSlippage = /slippage|price/i.test(reason);
+    return {
+      errorName: null,
+      humanMessage: `The call reverted: "${reason}".`,
+      suggestedAction: isSlippage
+        ? "The amounts did not match the pool's current ratio (or the price moved past your slippage). Re-quote and retry with ratio-matched amounts or a higher slippage tolerance."
+        : "Inspect the failing call — a lower-level contract rejected it with this message.",
+      rawError: clip(reason),
+    };
+  }
+
+  // Match a BVCC / OZ error: by errorName, by the authoritative data selector,
+  // by any KNOWN embedded selector, then by name mentioned in the message.
   let entry: Entry | undefined;
   if (errorName) entry = byName.get(errorName);
-  if (!entry && selector) entry = bySelector.get(selector);
+  if (!entry && dataSelector) entry = bySelector.get(dataSelector);
+  if (!entry) for (const s of embedded) if ((entry = bySelector.get(s))) break;
   if (!entry && raw) {
     for (const e of ENTRIES) {
       if (raw.includes(e.name)) {
@@ -219,15 +316,19 @@ export function decodeRevert(error: unknown): DecodedRevert {
     }
   }
 
-  const rawError = safeRaw(selector, errorName ?? entry?.name, raw);
   if (entry) {
     return {
       errorName: entry.name,
       humanMessage: entry.humanMessage,
       suggestedAction: entry.suggestedAction,
-      rawError,
+      // Prefer the authoritative data selector; else the matched error's own selector.
+      rawError: dataSelector ?? toFunctionSelector(entry.signature).toLowerCase(),
     };
   }
+
+  // Unknown. Surface the authoritative data (even if unrecognized, like 0xdeadbeef)
+  // or the panic code or the message — but NOT an untrusted embedded hex.
+  const rawError = dataSelector ?? reason ?? errorName ?? (raw ? clip(raw) : "unknown");
   return {
     errorName: errorName ?? null,
     humanMessage: "The transaction reverted for an unrecognized reason.",

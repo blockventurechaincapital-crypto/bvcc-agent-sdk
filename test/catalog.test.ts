@@ -4,6 +4,7 @@ import {
   CATALOG,
   capabilitiesByKind,
   getCapability,
+  filterByModules,
   type CapabilityKind,
 } from "../src/catalog.js";
 
@@ -53,7 +54,7 @@ describe("capability catalog", () => {
     const send = getCapability("sendToken")!;
     const good = send.params.safeParse({
       token: "USDC",
-      to: "0x3e3eb089169a7315a994947465ce5f5FC3A307D4",
+      to: "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
       amount: "0.5",
     });
     expect(good.success).toBe(true);
@@ -63,7 +64,7 @@ describe("capability catalog", () => {
 
     const badAmount = send.params.safeParse({
       token: "USDC",
-      to: "0x3e3eb089169a7315a994947465ce5f5FC3A307D4",
+      to: "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
       amount: "abc",
     });
     expect(badAmount.success).toBe(false);
@@ -108,5 +109,47 @@ describe("capability catalog", () => {
     const status = getCapability("getAgentStatus")!;
     expect(status.kind).toBe("read");
     expect(status.params.safeParse({}).success).toBe(true);
+  });
+});
+
+describe("capability modules (BVCC_MCP_MODULES)", () => {
+  it("labels every Aave capability so it can be switched off as a group", () => {
+    const aave = CATALOG.filter((c) => /^(aave|getAave|dryRunAave)/.test(c.id));
+    expect(aave.length).toBeGreaterThan(0);
+    for (const c of aave) expect(c.module).toBe("aave");
+  });
+
+  it("treats an unlabelled capability as core", () => {
+    const core = CATALOG.filter((c) => (c.module ?? "core") === "core");
+    expect(core.some((c) => c.id === "sendNative")).toBe(true);
+    expect(core.some((c) => c.id.startsWith("aave"))).toBe(false);
+  });
+
+  it("returns everything when no modules are requested", () => {
+    expect(filterByModules(CATALOG, []).length).toBe(CATALOG.length);
+  });
+
+  it("drops the whole Aave surface with modules=core", () => {
+    const only = filterByModules(CATALOG, ["core"]);
+    expect(only.length).toBeLessThan(CATALOG.length);
+    expect(only.some((c) => c.module === "aave")).toBe(false);
+  });
+
+  it("keeps only lending (plus the always-on meta guides) with modules=aave", () => {
+    const only = filterByModules(CATALOG, ["aave"]);
+    expect(only.every((c) => c.module === "aave" || c.module === "meta")).toBe(true);
+    expect(only.some((c) => c.module === "aave")).toBe(true);
+  });
+
+  it("is case- and whitespace-tolerant", () => {
+    expect(filterByModules(CATALOG, [" AAVE "]).length).toBe(filterByModules(CATALOG, ["aave"]).length);
+  });
+
+  it("degrades to a SMALLER surface on an unknown module, never a larger one", () => {
+    // A typo must not silently expose more than asked — only the always-on meta
+    // help (guides) survives, never a feature surface.
+    const only = filterByModules(CATALOG, ["lending"]);
+    expect(only.length).toBeLessThan(CATALOG.length);
+    expect(only.every((c) => c.module === "meta")).toBe(true);
   });
 });

@@ -16,7 +16,20 @@ import {
 } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 
-import { agentWalletAbi, erc20Abi, permit2AllowanceAbi, swapRouter02Abi } from "./abi.js";
+import {
+  agentWalletAbi,
+  erc20Abi,
+  nfpmAbi,
+  permit2AllowanceAbi,
+  swapRouter02Abi,
+  v3FactoryAbi,
+  v3PoolAbi,
+  v4StateViewAbi,
+  v4PositionManagerReadAbi,
+} from "./abi.js";
+import { detectWalletVersion, getActiveValidator, getPolicy, SELECTORS } from "./policy.js";
+import { AaveClient } from "./aave/client.js";
+import { buildNativeToToken, buildTokenToNative } from "./nativeSwap.js";
 import { getNetwork, type BvccNetwork } from "./networks.js";
 import {
   buildUniversalRouterSwap,
@@ -24,6 +37,36 @@ import {
   type UniversalRouterSwapParams,
 } from "./universalRouter.js";
 import { buildV4SwapExactIn, type V4SwapExactInParams } from "./universalRouterV4.js";
+import {
+  buildMintV3,
+  buildDecreaseV3,
+  buildCollectV3,
+  buildBurnV3,
+  orderV3Tokens,
+} from "./lp/v3.js";
+import {
+  feeToTickSpacing,
+  fullRangeTicks,
+  nearestUsableTick,
+  minusSlippage,
+  getSqrtRatioAtTick,
+  amountsForLiquidity,
+  getLiquidityForAmounts,
+  alignTickUp,
+  alignTickDown,
+  MIN_TICK,
+  MAX_TICK,
+} from "./lp/tickMath.js";
+import {
+  buildMintV4,
+  buildDecreaseV4,
+  buildCollectV4,
+  buildBurnV4,
+  orderV4Currencies,
+  poolId as v4PoolId,
+  NATIVE as V4_NATIVE,
+  type V4PoolKey,
+} from "./lp/v4.js";
 import { decodeRevert, type DecodedRevert } from "./errors.js";
 import { resolveToken } from "./tokens.js";
 import {
@@ -43,6 +86,7 @@ import type {
   AgentStatus,
   Balance,
   Capabilities,
+  MissingPolicy,
   DryRunResult,
   Execution,
   PreflightResult,
@@ -234,8 +278,8 @@ export class BvccAgentClient {
    * Build a Uniswap **v4** exact-input swap batch through the Universal Router
    * (command V4_SWAP), Permit2-funded — byte-compatible with app.uniswap.org's
    * v4 swaps. Use this to reach liquidity that lives on v4 pools. Single-hop via
-   * `{ fee, tickSpacing, hooks? }` or multi-hop via `{ path }`; `nativeOut` adds
-   * an UNWRAP_WETH leg (then `tokenOut` must be WETH).
+   * `{ fee, tickSpacing, hooks? }` or multi-hop via `{ path }`; `nativeOut` routes
+   * through the native (address(0)) pool and TAKEs ETH straight to the wallet.
    *
    * `allowedProtocols` must include **Permit2 and the router**; `tokenIn` must be
    * in `allowedTokens`. Defaults the router to the network's `universalRouter`.
@@ -253,8 +297,67 @@ export class BvccAgentClient {
   }
 
   /** Submit a Uniswap v4 exact-input swap. Structured result. */
-  swapV4ExactIn(params: Parameters<BvccAgentClient["buildSwapV4ExactIn"]>[0]): Promise<ActionResult> {
+  async swapV4ExactIn(
+    params: Parameters<BvccAgentClient["buildSwapV4ExactIn"]>[0],
+  ): Promise<ActionResult> {
     return this.run("swapV4", this.buildSwapV4ExactIn(params));
+  }
+
+  // ------------------------------------------------------------------
+  // Native ETH swaps (own batches via SwapRouter02 + WETH)
+  // ------------------------------------------------------------------
+
+  /** Resolve the router and WETH this chain needs for a native swap. */
+  private nativeSwapDeps(router?: Address): { router: Address; weth: Address } {
+    const r = router ?? this.network.swapRouter02;
+    if (!r) throw new Error(`No swapRouter02 configured for ${this.network.name}. Pass { router }.`);
+    if (!this.network.weth) throw new Error(`No WETH address known for ${this.network.name}.`);
+    return { router: r, weth: this.network.weth };
+  }
+
+  /**
+   * token → native ETH, as one atomic batch. Exact-output, so no WETH dust is left
+   * behind, and one 0.15% fee is charged.
+   *
+   * WETH must be in `allowedProtocols` (the unwrap targets it) and `tokenIn` in
+   * `allowedTokens`.
+   */
+  buildSwapToNative(params: {
+    tokenIn: Address;
+    amountOut: bigint;
+    amountInMaximum: bigint;
+    fee?: number;
+    router?: Address;
+  }): Execution[] {
+    const { router, weth } = this.nativeSwapDeps(params.router);
+    return buildTokenToNative({ ...params, router, weth, wallet: this.walletAddress });
+  }
+
+  /** Submit a token → ETH swap. Structured result. */
+  swapToNative(params: Parameters<BvccAgentClient["buildSwapToNative"]>[0]): Promise<ActionResult> {
+    return this.run("swapToNative", this.buildSwapToNative(params));
+  }
+
+  /**
+   * native ETH → token, as one atomic batch.
+   *
+   * The 0.15% agent fee applies. The swap is sized to the post-fee WETH, not to
+   * the ETH sent.
+   */
+  buildSwapFromNative(params: {
+    tokenOut: Address;
+    amountIn: bigint;
+    amountOutMinimum: bigint;
+    fee?: number;
+    router?: Address;
+  }): Execution[] {
+    const { router, weth } = this.nativeSwapDeps(params.router);
+    return buildNativeToToken({ ...params, router, weth, wallet: this.walletAddress });
+  }
+
+  /** Submit an ETH → token swap (0.15% agent fee). Structured result. */
+  swapFromNative(params: Parameters<BvccAgentClient["buildSwapFromNative"]>[0]): Promise<ActionResult> {
+    return this.run("swapFromNative", this.buildSwapFromNative(params));
   }
 
   /** ABI-encode a batch into `executionData` for `executeAsAgent`. */
@@ -319,6 +422,558 @@ export class BvccAgentClient {
     params: Parameters<BvccAgentClient["buildSwapExactInputV3"]>[0],
   ): Promise<ActionResult> {
     return this.run("swapV3", this.buildSwapExactInputV3(params));
+  }
+
+  // ------------------------------------------------------------------
+  // Uniswap v3 liquidity (NonfungiblePositionManager)
+  // ------------------------------------------------------------------
+  // mint/collect route to the wallet — the on-chain call policy pins the recipient
+  // (mint word 9, collect word 1), so a wrong recipient reverts. No increaseLiquidity
+  // helper: the NFPM does not gate it to the owner, so it would be a recipient bypass;
+  // to add liquidity, mint a fresh position.
+
+  /** Resolve the NFPM for this chain (or the override), else throw. */
+  private lpNfpm(nfpm?: Address): Address {
+    const a = nfpm ?? this.network.nfpm;
+    if (!a) {
+      throw new Error(
+        `No Uniswap v3 NonfungiblePositionManager configured for ${this.network.name}. Pass { nfpm }.`,
+      );
+    }
+    return a;
+  }
+
+  /** Read a v3 position's pool, range, liquidity and owed fees. */
+  async getV3Position(
+    tokenId: bigint,
+    nfpm?: Address,
+  ): Promise<{
+    token0: Address;
+    token1: Address;
+    fee: number;
+    tickLower: number;
+    tickUpper: number;
+    liquidity: bigint;
+    tokensOwed0: bigint;
+    tokensOwed1: bigint;
+  }> {
+    const p = (await this.publicClient.readContract({
+      address: this.lpNfpm(nfpm),
+      abi: nfpmAbi,
+      functionName: "positions",
+      args: [tokenId],
+    })) as readonly [
+      bigint,
+      Address,
+      Address,
+      Address,
+      number,
+      number,
+      number,
+      bigint,
+      bigint,
+      bigint,
+      bigint,
+      bigint,
+    ];
+    return {
+      token0: p[2],
+      token1: p[3],
+      fee: Number(p[4]),
+      tickLower: Number(p[5]),
+      tickUpper: Number(p[6]),
+      liquidity: p[7],
+      tokensOwed0: p[10],
+      tokensOwed1: p[11],
+    };
+  }
+
+  /**
+   * Build an "open v3 position" batch: approve(s) + mint, recipient = wallet.
+   * Range defaults to full-range for the fee tier; pass explicit `tickLower`/
+   * `tickUpper` for a concentrated position (they are aligned to the pool's tick
+   * spacing). Amount minimums default to `slippageBps` below the desired amounts
+   * (50 bps = 0.5%). Tokens are address-sorted internally, so pass amounts against
+   * the tokens you name (tokenA↔amountA, tokenB↔amountB).
+   *
+   * The NFPM must be in `allowedProtocols` with the NFPM call policies registered;
+   * both approves count toward the agent's token budget.
+   */
+  buildAddLiquidityV3(params: {
+    tokenA: Address;
+    amountA: bigint;
+    tokenB: Address;
+    amountB: bigint;
+    fee: number;
+    tickLower?: number;
+    tickUpper?: number;
+    amountAMin?: bigint;
+    amountBMin?: bigint;
+    slippageBps?: number;
+    deadline?: bigint;
+    nfpm?: Address;
+  }): Execution[] {
+    const nfpm = this.lpNfpm(params.nfpm);
+    const { token0, token1, amount0, amount1, flipped } = orderV3Tokens(
+      params.tokenA,
+      params.amountA,
+      params.tokenB,
+      params.amountB,
+    );
+    const slip = params.slippageBps ?? 50;
+    const minA = params.amountAMin ?? minusSlippage(params.amountA, slip);
+    const minB = params.amountBMin ?? minusSlippage(params.amountB, slip);
+    const amount0Min = flipped ? minB : minA;
+    const amount1Min = flipped ? minA : minB;
+
+    let tickLower: number;
+    let tickUpper: number;
+    if (params.tickLower != null && params.tickUpper != null) {
+      const spacing = feeToTickSpacing(params.fee);
+      tickLower = nearestUsableTick(params.tickLower, spacing);
+      tickUpper = nearestUsableTick(params.tickUpper, spacing);
+      if (tickLower >= tickUpper) throw new Error("tickLower must be < tickUpper after alignment.");
+    } else {
+      ({ tickLower, tickUpper } = fullRangeTicks(params.fee));
+    }
+
+    return buildMintV3({
+      nfpm,
+      token0,
+      token1,
+      fee: params.fee,
+      tickLower,
+      tickUpper,
+      amount0Desired: amount0,
+      amount1Desired: amount1,
+      amount0Min,
+      amount1Min,
+      recipient: this.walletAddress,
+      deadline: params.deadline,
+    });
+  }
+
+  /** Read a v3 pool's current sqrtPriceX96 (via the factory), for sizing a mint. */
+  async getV3PoolSqrtPrice(
+    token0: Address,
+    token1: Address,
+    fee: number,
+    factory?: Address,
+  ): Promise<bigint> {
+    const f = factory ?? this.network.v3Factory;
+    if (!f) {
+      throw new Error(
+        `No Uniswap v3 factory configured for ${this.network.name}. Pass amounts already matched to the pool ratio.`,
+      );
+    }
+    const pool = (await this.publicClient.readContract({
+      address: f,
+      abi: v3FactoryAbi,
+      functionName: "getPool",
+      args: [token0, token1, fee],
+    })) as Address;
+    if (pool === ZERO) {
+      throw new Error(`No Uniswap v3 pool exists for that pair at fee ${fee} on ${this.network.name}.`);
+    }
+    const slot0 = (await this.publicClient.readContract({
+      address: pool,
+      abi: v3PoolAbi,
+      functionName: "slot0",
+    })) as readonly [bigint, number, number, number, number, number, boolean];
+    return slot0[0];
+  }
+
+  /**
+   * Size an "open v3 position" batch from the pool's current price so the two
+   * amounts are matched to the pool ratio and the amount minimums hold. `amountA`/
+   * `amountB` are treated as the MAXIMUM you're willing to deposit of each token;
+   * the balanced (usually smaller) actual amounts are computed from the price and
+   * chosen range. Falls back to the naive `buildAddLiquidityV3` only if no factory
+   * is configured for the chain. Async (reads the pool); use for real mints.
+   */
+  async planAddLiquidityV3(params: {
+    tokenA: Address;
+    amountA: bigint;
+    tokenB: Address;
+    amountB: bigint;
+    fee: number;
+    tickLower?: number;
+    tickUpper?: number;
+    slippageBps?: number;
+    deadline?: bigint;
+    nfpm?: Address;
+    factory?: Address;
+  }): Promise<Execution[]> {
+    const factory = params.factory ?? this.network.v3Factory;
+    // No factory → cannot read the price; fall back to the caller's raw amounts.
+    if (!factory) return this.buildAddLiquidityV3(params);
+
+    const nfpm = this.lpNfpm(params.nfpm);
+    const { token0, token1, amount0: amount0Max, amount1: amount1Max } = orderV3Tokens(
+      params.tokenA,
+      params.amountA,
+      params.tokenB,
+      params.amountB,
+    );
+
+    let tickLower: number;
+    let tickUpper: number;
+    if (params.tickLower != null && params.tickUpper != null) {
+      const spacing = feeToTickSpacing(params.fee);
+      tickLower = nearestUsableTick(params.tickLower, spacing);
+      tickUpper = nearestUsableTick(params.tickUpper, spacing);
+      if (tickLower >= tickUpper) throw new Error("tickLower must be < tickUpper after alignment.");
+    } else {
+      ({ tickLower, tickUpper } = fullRangeTicks(params.fee));
+    }
+
+    const sqrtP = await this.getV3PoolSqrtPrice(token0, token1, params.fee, factory);
+    const sqrtA = getSqrtRatioAtTick(tickLower);
+    const sqrtB = getSqrtRatioAtTick(tickUpper);
+    const liquidity = getLiquidityForAmounts(sqrtP, sqrtA, sqrtB, amount0Max, amount1Max);
+    if (liquidity <= 0n) {
+      throw new Error("Could not size any liquidity from the given amounts — increase one side.");
+    }
+    // The amounts the NFPM will actually pull for this liquidity (≤ the maxes).
+    const { amount0, amount1 } = amountsForLiquidity(sqrtP, tickLower, tickUpper, liquidity);
+    const slip = params.slippageBps ?? 50;
+
+    return buildMintV3({
+      nfpm,
+      token0,
+      token1,
+      fee: params.fee,
+      tickLower,
+      tickUpper,
+      amount0Desired: amount0,
+      amount1Desired: amount1,
+      amount0Min: minusSlippage(amount0, slip),
+      amount1Min: minusSlippage(amount1, slip),
+      recipient: this.walletAddress,
+      deadline: params.deadline,
+    });
+  }
+
+  /** Open a v3 position (amounts auto-balanced to the pool ratio). Structured result. */
+  async addLiquidityV3(
+    params: Parameters<BvccAgentClient["planAddLiquidityV3"]>[0],
+  ): Promise<ActionResult> {
+    return this.run("addLiquidityV3", await this.planAddLiquidityV3(params));
+  }
+
+  /** Build a collect-fees batch (recipient = wallet). */
+  buildCollectFeesV3(tokenId: bigint, nfpm?: Address): Execution[] {
+    return buildCollectV3({ nfpm: this.lpNfpm(nfpm), tokenId, recipient: this.walletAddress });
+  }
+
+  /** Collect owed fees to the wallet. Structured result. */
+  collectFeesV3(tokenId: bigint, nfpm?: Address): Promise<ActionResult> {
+    return this.run("collectFeesV3", this.buildCollectFeesV3(tokenId, nfpm));
+  }
+
+  /**
+   * Build a remove-liquidity batch: `decreaseLiquidity` + `collect`, both to the
+   * wallet. Pass an explicit `liquidity`, or a `bps` fraction (10000 = all) of the
+   * position's current liquidity (read on-chain). `amount0Min`/`amount1Min` default
+   * to 0 — set them for price protection. With `burn: true` and a full removal the
+   * emptied NFT is burned in the same batch.
+   */
+  async buildRemoveLiquidityV3(params: {
+    tokenId: bigint;
+    liquidity?: bigint;
+    bps?: number;
+    amount0Min?: bigint;
+    amount1Min?: bigint;
+    burn?: boolean;
+    deadline?: bigint;
+    nfpm?: Address;
+  }): Promise<Execution[]> {
+    const nfpm = this.lpNfpm(params.nfpm);
+    let liquidity = params.liquidity;
+    let removingAll = false;
+    if (liquidity == null) {
+      const pos = await this.getV3Position(params.tokenId, nfpm);
+      const bps = params.bps ?? 10000;
+      if (bps <= 0 || bps > 10000) throw new Error("bps must be in (0, 10000].");
+      liquidity = (pos.liquidity * BigInt(bps)) / 10000n;
+      removingAll = bps === 10000;
+    }
+    if (liquidity <= 0n) throw new Error("Nothing to remove: position liquidity is 0.");
+    const executions = buildDecreaseV3({
+      nfpm,
+      tokenId: params.tokenId,
+      liquidity,
+      amount0Min: params.amount0Min ?? 0n,
+      amount1Min: params.amount1Min ?? 0n,
+      recipient: this.walletAddress,
+      deadline: params.deadline,
+    });
+    if (params.burn && removingAll) {
+      executions.push(...buildBurnV3(nfpm, params.tokenId));
+    }
+    return executions;
+  }
+
+  /** Remove liquidity (decrease + collect, optional burn). Structured result. */
+  async removeLiquidityV3(
+    params: Parameters<BvccAgentClient["buildRemoveLiquidityV3"]>[0],
+  ): Promise<ActionResult> {
+    return this.run("removeLiquidityV3", await this.buildRemoveLiquidityV3(params));
+  }
+
+  /** Burn an already-empty position NFT. Structured result. */
+  burnV3(tokenId: bigint, nfpm?: Address): Promise<ActionResult> {
+    return this.run("burnV3", buildBurnV3(this.lpNfpm(nfpm), tokenId));
+  }
+
+  /** Dry-run: open a v3 position (amounts auto-balanced to the pool ratio). */
+  async dryRunAddLiquidityV3(
+    params: Parameters<BvccAgentClient["planAddLiquidityV3"]>[0],
+  ): Promise<DryRunResult> {
+    return this.dryRun("addLiquidityV3", await this.planAddLiquidityV3(params));
+  }
+
+  /** Dry-run: remove liquidity. */
+  async dryRunRemoveLiquidityV3(
+    params: Parameters<BvccAgentClient["buildRemoveLiquidityV3"]>[0],
+  ): Promise<DryRunResult> {
+    return this.dryRun("removeLiquidityV3", await this.buildRemoveLiquidityV3(params));
+  }
+
+  /** Dry-run: collect fees. */
+  dryRunCollectFeesV3(tokenId: bigint, nfpm?: Address): Promise<DryRunResult> {
+    return this.dryRun("collectFeesV3", this.buildCollectFeesV3(tokenId, nfpm));
+  }
+
+  // ------------------------------------------------------------------
+  // Uniswap v4 liquidity (PositionManager modifyLiquidities)
+  // ------------------------------------------------------------------
+  // Native-ETH LP lives here (currency0 = address(0)). Recipients are pinned to the
+  // wallet by the BVCCPositionManagerValidator (DEEP). This FAILS CLOSED until that
+  // validator is active in the registry (48h governance) and the owner has set the
+  // DEEP policy on (PositionManager, modifyLiquidities) — until then, use v3.
+
+  /** Resolve the v4 PositionManager for this chain (or override), else throw. */
+  private lpPmV4(pm?: Address): Address {
+    const a = pm ?? this.network.positionManagerV4;
+    if (!a) throw new Error(`No Uniswap v4 PositionManager configured for ${this.network.name}. Pass { positionManager }.`);
+    return a;
+  }
+
+  /** Read a v4 pool's current sqrtPriceX96 from the StateView (by poolId). */
+  async getV4PoolSqrtPrice(key: V4PoolKey, stateView?: Address): Promise<bigint> {
+    const sv = stateView ?? this.network.v4StateView;
+    if (!sv) throw new Error(`No Uniswap v4 StateView configured for ${this.network.name}. Pass amounts sized to the pool.`);
+    const slot0 = (await this.publicClient.readContract({
+      address: sv,
+      abi: v4StateViewAbi,
+      functionName: "getSlot0",
+      args: [v4PoolId(key)],
+    })) as readonly [bigint, number, number, number];
+    return slot0[0];
+  }
+
+  /** Read a v4 position's pool key and current liquidity. */
+  async getV4Position(tokenId: bigint, pm?: Address): Promise<{ key: V4PoolKey; liquidity: bigint }> {
+    const p = this.lpPmV4(pm);
+    const res = (await this.publicClient.readContract({
+      address: p,
+      abi: v4PositionManagerReadAbi,
+      functionName: "getPoolAndPositionInfo",
+      args: [tokenId],
+    })) as readonly [V4PoolKey, bigint];
+    const liquidity = (await this.publicClient.readContract({
+      address: p,
+      abi: v4PositionManagerReadAbi,
+      functionName: "getPositionLiquidity",
+      args: [tokenId],
+    })) as bigint;
+    return { key: res[0], liquidity };
+  }
+
+  /**
+   * Size a v4 mint from the pool's current price and build it. `tokenA`/`tokenB`
+   * use `address(0)` for native ETH; the pair is sorted internally (native sorts to
+   * currency0). Amounts are the MAXIMUMS; the actual amounts are matched to the pool
+   * ratio. Range defaults to full-range for the tick spacing (from `fee` unless
+   * `tickSpacing` is given). `hooks` defaults to none (address(0)); a hooked pool
+   * only works if that hook is approved in the BVCCHookRegistry.
+   */
+  async planAddLiquidityV4(params: {
+    tokenA: Address;
+    amountA: bigint;
+    tokenB: Address;
+    amountB: bigint;
+    fee: number;
+    tickSpacing?: number;
+    hooks?: Address;
+    tickLower?: number;
+    tickUpper?: number;
+    slippageBps?: number;
+    deadline?: bigint;
+    positionManager?: Address;
+    stateView?: Address;
+  }): Promise<Execution[]> {
+    const pm = this.lpPmV4(params.positionManager);
+    const tickSpacing = params.tickSpacing ?? feeToTickSpacing(params.fee);
+    const hooks = params.hooks ?? V4_NATIVE;
+    const { key, flipped } = orderV4Currencies(params.tokenA, params.tokenB, params.fee, tickSpacing, hooks);
+    const amount0Max = flipped ? params.amountB : params.amountA;
+    const amount1Max = flipped ? params.amountA : params.amountB;
+
+    let tickLower: number;
+    let tickUpper: number;
+    if (params.tickLower != null && params.tickUpper != null) {
+      tickLower = nearestUsableTick(params.tickLower, tickSpacing);
+      tickUpper = nearestUsableTick(params.tickUpper, tickSpacing);
+      if (tickLower >= tickUpper) throw new Error("tickLower must be < tickUpper after alignment.");
+    } else {
+      tickLower = alignTickUp(MIN_TICK, tickSpacing);
+      tickUpper = alignTickDown(MAX_TICK, tickSpacing);
+    }
+
+    const sqrtP = await this.getV4PoolSqrtPrice(key, params.stateView);
+    const liquidity = getLiquidityForAmounts(
+      sqrtP,
+      getSqrtRatioAtTick(tickLower),
+      getSqrtRatioAtTick(tickUpper),
+      amount0Max,
+      amount1Max,
+    );
+    if (liquidity <= 0n) throw new Error("Could not size any liquidity from the given amounts — increase one side.");
+
+    return buildMintV4({
+      positionManager: pm,
+      key,
+      tickLower,
+      tickUpper,
+      liquidity,
+      amount0Max,
+      amount1Max,
+      recipient: this.walletAddress,
+      deadline: params.deadline,
+    });
+  }
+
+  /** Open a v4 position (native ETH supported). Structured result. */
+  async addLiquidityV4(
+    params: Parameters<BvccAgentClient["planAddLiquidityV4"]>[0],
+  ): Promise<ActionResult> {
+    return this.run("addLiquidityV4", await this.planAddLiquidityV4(params));
+  }
+
+  /** Build a remove-liquidity (or burn) batch for a v4 position, proceeds to wallet. */
+  async buildRemoveLiquidityV4(params: {
+    tokenId: bigint;
+    bps?: number;
+    liquidity?: bigint;
+    amount0Min?: bigint;
+    amount1Min?: bigint;
+    burn?: boolean;
+    deadline?: bigint;
+    positionManager?: Address;
+  }): Promise<Execution[]> {
+    const pm = this.lpPmV4(params.positionManager);
+    const pos = await this.getV4Position(params.tokenId, pm);
+    let liquidity = params.liquidity;
+    let removingAll = false;
+    if (liquidity == null) {
+      const bps = params.bps ?? 10000;
+      if (bps <= 0 || bps > 10000) throw new Error("bps must be in (0, 10000].");
+      liquidity = (pos.liquidity * BigInt(bps)) / 10000n;
+      removingAll = bps === 10000;
+    }
+    // BURN_POSITION removes any remaining liquidity and burns in one action.
+    if (params.burn && removingAll) {
+      return buildBurnV4({
+        positionManager: pm,
+        tokenId: params.tokenId,
+        amount0Min: params.amount0Min ?? 0n,
+        amount1Min: params.amount1Min ?? 0n,
+        currency0: pos.key.currency0,
+        currency1: pos.key.currency1,
+        recipient: this.walletAddress,
+        deadline: params.deadline,
+      });
+    }
+    if (liquidity <= 0n) throw new Error("Nothing to remove: position liquidity is 0.");
+    return buildDecreaseV4({
+      positionManager: pm,
+      tokenId: params.tokenId,
+      liquidity,
+      amount0Min: params.amount0Min ?? 0n,
+      amount1Min: params.amount1Min ?? 0n,
+      currency0: pos.key.currency0,
+      currency1: pos.key.currency1,
+      recipient: this.walletAddress,
+      deadline: params.deadline,
+    });
+  }
+
+  /** Remove v4 liquidity (decrease + take, optional burn). Structured result. */
+  async removeLiquidityV4(
+    params: Parameters<BvccAgentClient["buildRemoveLiquidityV4"]>[0],
+  ): Promise<ActionResult> {
+    return this.run("removeLiquidityV4", await this.buildRemoveLiquidityV4(params));
+  }
+
+  /** Collect a v4 position's fees to the wallet. Structured result. */
+  async collectFeesV4(tokenId: bigint, pm?: Address): Promise<ActionResult> {
+    const p = this.lpPmV4(pm);
+    const pos = await this.getV4Position(tokenId, p);
+    return this.run(
+      "collectFeesV4",
+      buildCollectV4({
+        positionManager: p,
+        tokenId,
+        currency0: pos.key.currency0,
+        currency1: pos.key.currency1,
+        recipient: this.walletAddress,
+      }),
+    );
+  }
+
+  /** Burn a v4 position (removes remaining liquidity + burns), proceeds to wallet. */
+  async burnV4(tokenId: bigint, pm?: Address): Promise<ActionResult> {
+    const p = this.lpPmV4(pm);
+    const pos = await this.getV4Position(tokenId, p);
+    return this.run(
+      "burnV4",
+      buildBurnV4({
+        positionManager: p,
+        tokenId,
+        amount0Min: 0n,
+        amount1Min: 0n,
+        currency0: pos.key.currency0,
+        currency1: pos.key.currency1,
+        recipient: this.walletAddress,
+      }),
+    );
+  }
+
+  /** Dry-run: open a v4 position. */
+  async dryRunAddLiquidityV4(
+    params: Parameters<BvccAgentClient["planAddLiquidityV4"]>[0],
+  ): Promise<DryRunResult> {
+    return this.dryRun("addLiquidityV4", await this.planAddLiquidityV4(params));
+  }
+
+  /** Dry-run: remove v4 liquidity. */
+  async dryRunRemoveLiquidityV4(
+    params: Parameters<BvccAgentClient["buildRemoveLiquidityV4"]>[0],
+  ): Promise<DryRunResult> {
+    return this.dryRun("removeLiquidityV4", await this.buildRemoveLiquidityV4(params));
+  }
+
+  // ------------------------------------------------------------------
+  // Aave v3 (lazy — only constructed when accessed)
+  // ------------------------------------------------------------------
+
+  private _aave?: AaveClient;
+
+  /** Aave v3 lending operations for this wallet. Reverts if the chain has no Aave. */
+  get aave(): AaveClient {
+    return (this._aave ??= new AaveClient(this));
   }
 
   // ------------------------------------------------------------------
@@ -586,9 +1241,21 @@ export class BvccAgentClient {
     };
   }
 
-  /** Derive what the agent can currently do from its on-chain permission. */
+  /**
+   * Derive what the agent can currently do.
+   *
+   * On V3 wallets the permission struct is only half the answer: Case-3 calls also
+   * need a registered call policy per selector, and DEEP policies need a validator
+   * live in the registry. Reporting `canSwapV4: true` off permissions alone sends
+   * the agent into a guaranteed revert — and worse, it stays true after BVCC uses
+   * the registry kill-switch. So on V3 the swap flags are also gated on policies.
+   */
   async getCapabilities(agent: Address = this.agentAddress): Promise<Capabilities> {
-    const [p, isPaused] = await Promise.all([this.getPermission(agent), this.isPaused()]);
+    const [p, isPaused, walletVersion] = await Promise.all([
+      this.getPermission(agent),
+      this.isPaused(),
+      detectWalletVersion(this.publicClient, this.walletAddress),
+    ]);
     const protos = p.allowedProtocols.map((a) => a.toLowerCase());
     const has = (a?: Address) => !!a && protos.includes(a.toLowerCase());
     const hasPermit2 = protos.includes(PERMIT2.toLowerCase());
@@ -608,15 +1275,73 @@ export class BvccAgentClient {
     if (has(this.network.universalRouter) && !hasPermit2)
       notes.push("Universal Router whitelisted but Permit2 is not — v4/UR swaps will revert.");
 
+    let policyOkV3 = true;
+    let policyOkV4 = true;
+    const missingPolicies: MissingPolicy[] = [];
+
+    if (walletVersion === "v3") {
+      const registry = this.network.validatorRegistry;
+      const router = this.network.swapRouter02;
+      const ur = this.network.universalRouter;
+
+      const [pSwap, pUr, pPermit2, urValidator] = await Promise.all([
+        router ? getPolicy(this.publicClient, this.walletAddress, router, SELECTORS.exactInputSingle) : null,
+        ur ? getPolicy(this.publicClient, this.walletAddress, ur, SELECTORS.urExecute) : null,
+        getPolicy(this.publicClient, this.walletAddress, PERMIT2, SELECTORS.permit2Approve),
+        registry && ur ? getActiveValidator(this.publicClient, registry, ur) : null,
+      ]);
+
+      if (router && pSwap && !pSwap.allowed) {
+        policyOkV3 = false;
+        missingPolicies.push({
+          action: "swapV3",
+          protocol: router,
+          selector: SELECTORS.exactInputSingle,
+          label: "SwapRouter02 exactInputSingle",
+        });
+      }
+      if (ur && pUr && !pUr.allowed) {
+        policyOkV4 = false;
+        missingPolicies.push({
+          action: "swapV4",
+          protocol: ur,
+          selector: SELECTORS.urExecute,
+          label: "Universal Router execute",
+        });
+      }
+      if (!pPermit2.allowed) {
+        policyOkV4 = false;
+        missingPolicies.push({
+          action: "swapV4",
+          protocol: PERMIT2,
+          selector: SELECTORS.permit2Approve,
+          label: "Permit2 approve",
+        });
+      }
+      // A DEEP policy is inert without a live validator: the registry fails closed.
+      if (ur && pUr?.allowed && pUr.deep && !urValidator) {
+        policyOkV4 = false;
+        notes.push(
+          "No validator is active for the Universal Router — deep-validated swaps fail closed. Use SwapRouter02 (v3) instead.",
+        );
+      }
+      if (missingPolicies.length > 0)
+        notes.push(
+          "Wallet V3: some call policies are missing. The owner must add these protocols to the agent in the dashboard.",
+        );
+    }
+
     return {
       canSendNative: live,
       canSendTokens: live && hasTokens,
       canApprove: live && hasTokens,
-      canSwapV3: live && hasTokens && has(this.network.swapRouter02),
-      canSwapV4: live && hasTokens && has(this.network.universalRouter) && hasPermit2,
+      canSwapV3: live && hasTokens && has(this.network.swapRouter02) && policyOkV3,
+      canSwapV4: live && hasTokens && has(this.network.universalRouter) && hasPermit2 && policyOkV4,
       allowedSwapTokens: p.allowedTokens,
       allowedProtocols: p.allowedProtocols,
       notes,
+      walletVersion,
+      missingPolicies,
     };
   }
 

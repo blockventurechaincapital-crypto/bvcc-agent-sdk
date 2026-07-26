@@ -14,14 +14,16 @@ import type { Execution } from "./types.js";
 /**
  * Uniswap v4 swap encoder for the Universal Router (command V4_SWAP = 0x10).
  *
- * Verified byte-for-byte against a real v4 swap produced by app.uniswap.org and
- * routed through a BVCC wallet. The v4 ExactInputParams layout matches the
- * current v4-periphery (note the `minHopPriceX36` array, empty here):
+ * The v4 ExactInputParams layout is the canonical v4-periphery IV4Router struct.
+ * (An earlier version carried a phantom `uint256[] minHopPriceX36` field that the
+ * deployed routers do not have; it shifted `amountIn`/`amountOutMinimum` by one
+ * slot, so the router read the array offset as `amountIn` — the swap under-filled
+ * to dust and ignored the min. Removed; confirmed on-chain against the Arbitrum
+ * UR 0xa51afafe…381a3.)
  *
  *   struct ExactInputParams {
  *     Currency currencyIn;
  *     PathKey[] path;
- *     uint256[] minHopPriceX36;   // empty
  *     uint128 amountIn;
  *     uint128 amountOutMinimum;
  *   }
@@ -31,9 +33,11 @@ import type { Execution } from "./types.js";
  *   }
  *
  * Plan = SWAP_EXACT_IN (0x07) + SETTLE (0x0b) + TAKE (0x0e). Token input is
- * funded through Permit2 (no blind transfer). For native output the swap targets
- * WETH and a trailing UNWRAP_WETH (0x0c) delivers ETH — the real slippage bound
- * is enforced on the unwrap, exactly like the Uniswap UI does.
+ * funded through Permit2 (no blind transfer). For native output the swap routes
+ * through the native pool (output currency = address(0)) and the TAKE sends ETH
+ * straight to the wallet — no WETH, no UNWRAP_WETH, no ADDRESS_THIS. This keeps
+ * the calldata inside the UR validator's ERC-20-recipient rule (every output
+ * lands in the wallet; nothing is ever parked in the router to be swept).
  */
 
 // v4 Router actions.
@@ -43,13 +47,11 @@ const ACTION_TAKE = 0x0e;
 
 // Universal Router commands.
 const CMD_V4_SWAP = 0x10;
-const CMD_UNWRAP_WETH = 0x0c;
 
 // Sentinels.
 const OPEN_DELTA = 0n;
-const ADDRESS_THIS: Address = "0x0000000000000000000000000000000000000002";
 
-const ZERO_ADDR: Address = "0x0000000000000000000000000000000000000000";
+const ZERO_ADDR: Address = "0x0000000000000000000000000000000000000000"; // = native currency (v4 ETH side)
 const MAX_UINT160 = (1n << 160n) - 1n;
 
 const URROUTER_ABI = [
@@ -92,7 +94,7 @@ export interface V4PathKey {
 
 const PATHKEY_T =
   "(address intermediateCurrency, uint24 fee, int24 tickSpacing, address hooks, bytes hookData)";
-const EXACT_IN_T = `(address currencyIn, ${PATHKEY_T}[] path, uint256[] minHopPriceX36, uint128 amountIn, uint128 amountOutMinimum)`;
+const EXACT_IN_T = `(address currencyIn, ${PATHKEY_T}[] path, uint128 amountIn, uint128 amountOutMinimum)`;
 
 function encodeActions(actions: number[]): Hex {
   return concatHex(actions.map((a) => (("0x" + a.toString(16).padStart(2, "0")) as Hex)));
@@ -106,7 +108,7 @@ export interface V4SwapExactInParams {
   router: Address;
   /** Input token (ERC-20). Native ETH input is not supported by this helper yet. */
   tokenIn: Address;
-  /** Final output currency. For `nativeOut` this must be WETH. */
+  /** Final output currency (ERC-20). Ignored when `nativeOut` is set (output = address(0)). */
   tokenOut: Address;
   amountIn: bigint;
   amountOutMinimum: bigint;
@@ -117,7 +119,8 @@ export interface V4SwapExactInParams {
   hookData?: Hex;
   /** Multi-hop override: ordered PathKeys ending at `tokenOut`. */
   path?: V4PathKey[];
-  /** Deliver native ETH by unwrapping WETH output. `tokenOut` must be WETH. */
+  /** Deliver native ETH via the native (address(0)) pool — TAKE goes straight to
+   *  the wallet, no WETH/UNWRAP_WETH. Pass the native pool's `fee`/`tickSpacing`. */
   nativeOut?: boolean;
   /** Output recipient (defaults to MSG_SENDER → the caller wallet). */
   recipient?: Address;
@@ -136,11 +139,17 @@ export interface V4SwapExactInParams {
 export function buildV4SwapExactIn(p: V4SwapExactInParams): Execution[] {
   if (p.amountIn > MAX_UINT160) throw new Error("amountIn exceeds uint160 (Permit2 limit)");
 
+  // Native output routes through the native pool: the output currency is
+  // address(0) and the TAKE delivers ETH straight to the wallet. ERC-20 output
+  // uses tokenOut. Either way nothing is parked in the router (no ADDRESS_THIS,
+  // no UNWRAP_WETH) — the UR validator requires every output to land in the wallet.
+  const outputCurrency = p.nativeOut ? ZERO_ADDR : p.tokenOut;
+
   const path: V4PathKey[] =
     p.path ??
     [
       {
-        intermediateCurrency: p.tokenOut,
+        intermediateCurrency: outputCurrency,
         fee: p.fee ?? 3000,
         tickSpacing: p.tickSpacing ?? 60,
         hooks: p.hooks ?? ZERO_ADDR,
@@ -150,11 +159,6 @@ export function buildV4SwapExactIn(p: V4SwapExactInParams): Execution[] {
 
   const deadline = p.deadline ?? BigInt(Math.floor(Date.now() / 1000) + 1200);
   const finalRecipient = p.recipient ?? "0x0000000000000000000000000000000000000001"; // MSG_SENDER
-
-  // For native output the swap delivers WETH into the router, then UNWRAP_WETH
-  // sends ETH to the recipient with the real min; the v4 min stays 0.
-  const takeRecipient = p.nativeOut ? ADDRESS_THIS : finalRecipient;
-  const v4MinOut = p.nativeOut ? 0n : p.amountOutMinimum;
 
   const swapParams = encodeAbiParameters(parseAbiParameters(EXACT_IN_T), [
     {
@@ -166,9 +170,10 @@ export function buildV4SwapExactIn(p: V4SwapExactInParams): Execution[] {
         hooks: k.hooks ?? ZERO_ADDR,
         hookData: k.hookData ?? "0x",
       })),
-      minHopPriceX36: [],
       amountIn: p.amountIn,
-      amountOutMinimum: v4MinOut,
+      // The real slippage floor lives on the swap itself — TAKE goes to the wallet,
+      // there is no unwrap leg to move the check to.
+      amountOutMinimum: p.amountOutMinimum,
     },
   ] as never);
 
@@ -178,7 +183,7 @@ export function buildV4SwapExactIn(p: V4SwapExactInParams): Execution[] {
   );
   const takeParams = encodeAbiParameters(
     parseAbiParameters("address currency, address recipient, uint256 amount"),
-    [p.tokenOut, takeRecipient, OPEN_DELTA],
+    [outputCurrency, finalRecipient, OPEN_DELTA],
   );
 
   const actions = encodeActions([ACTION_SWAP_EXACT_IN, ACTION_SETTLE, ACTION_TAKE]);
@@ -187,23 +192,10 @@ export function buildV4SwapExactIn(p: V4SwapExactInParams): Execution[] {
     [swapParams, settleParams, takeParams],
   ]);
 
-  const cmds = [CMD_V4_SWAP];
-  const inputs: Hex[] = [v4Input];
-
-  if (p.nativeOut) {
-    cmds.push(CMD_UNWRAP_WETH);
-    inputs.push(
-      encodeAbiParameters(parseAbiParameters("address recipient, uint256 amountMin"), [
-        finalRecipient,
-        p.amountOutMinimum,
-      ]),
-    );
-  }
-
   const executeData = encodeFunctionData({
     abi: URROUTER_ABI,
     functionName: "execute",
-    args: [commandsHex(cmds), inputs, deadline],
+    args: [commandsHex([CMD_V4_SWAP]), [v4Input], deadline],
   });
 
   // Permit2 funding for the ERC-20 input (no blind transfer to the router).

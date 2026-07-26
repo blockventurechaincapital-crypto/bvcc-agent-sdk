@@ -15,6 +15,13 @@ export interface ResolvedToken {
 }
 
 /**
+ * Native currency sentinel. In Uniswap v4 a pool's ETH side is `address(0)` (not
+ * WETH); a native swap's output currency is this. Native is always 18 decimals
+ * (ETH/BNB/POL), so it resolves without an on-chain `decimals()` read.
+ */
+export const NATIVE_TOKEN: Address = "0x0000000000000000000000000000000000000000";
+
+/**
  * Minimal, verified token registry per chain. Addresses are canonical and
  * deliberately conservative — only well-known tokens are listed. Extend by
  * passing addresses directly to `resolveToken`. No invented addresses.
@@ -70,6 +77,12 @@ export const TOKENS: Record<number, Record<string, TokenInfo>> = {
  */
 export function resolveToken(chainId: number, symbolOrAddress: string): ResolvedToken {
   const table = TOKENS[chainId] ?? {};
+
+  // Native currency (v4 uses address(0) for the ETH side). Always 18 decimals, so
+  // it resolves cleanly instead of failing a decimals() read on the zero address.
+  if (symbolOrAddress.toLowerCase() === NATIVE_TOKEN) {
+    return { address: NATIVE_TOKEN, symbol: "ETH", decimals: 18 };
+  }
 
   if (isAddress(symbolOrAddress)) {
     const lower = symbolOrAddress.toLowerCase();

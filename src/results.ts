@@ -9,7 +9,24 @@ export type ActionName =
   | "swapV3"
   | "swapV4"
   | "swapUniversalRouter"
-  | "execute";
+  | "swapToNative"
+  | "swapFromNative"
+  | "addLiquidityV3"
+  | "removeLiquidityV3"
+  | "collectFeesV3"
+  | "burnV3"
+  | "addLiquidityV4"
+  | "removeLiquidityV4"
+  | "collectFeesV4"
+  | "burnV4"
+  | "execute"
+  | "aaveSupply"
+  | "aaveWithdraw"
+  | "aaveBorrow"
+  | "aaveRepay"
+  | "aaveRepayWithATokens"
+  | "aaveSetCollateral"
+  | "aaveSetEMode";
 
 export interface ActionContext {
   network: string;

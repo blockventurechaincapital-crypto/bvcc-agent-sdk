@@ -35,7 +35,12 @@ uses to actually move funds within those rules.
 ### What your agent can do with it
 
 - Send ETH (or BNB) and tokens like USDC.
-- Swap tokens on Uniswap (v3 and v4).
+- Swap tokens on Uniswap (v3 and v4), and to or from native ETH.
+- Provide liquidity on Uniswap (v3 and v4, including native-ETH pools): open a
+  position, collect its fees, and close it — proceeds always return to the wallet.
+- Lend and borrow on Aave: deposit, borrow, repay, withdraw.
+- **Unwind an Aave position on its own** — sell collateral to repay debt step by
+  step, or close the whole thing, without ever letting the position get unsafe.
 - Check its balances and how much of its allowance is left.
 - Find out *why* an action would fail **before** trying it (so it doesn't waste gas).
 
@@ -148,6 +153,136 @@ await agent.swapV4ExactIn({
 });
 ```
 
+### Swap to and from native ETH
+
+Uniswap works with WETH, not raw ETH, so these batches wrap or unwrap for you and
+keep every hop's recipient as the wallet.
+
+```ts
+// token → ETH. Exact output: you get precisely this much ETH, no dust left over.
+await agent.swapToNative({
+  tokenIn: usdc,
+  amountOut: parseEther("0.01"),      // exactly what you want to receive
+  amountInMaximum: parseUnits("25", 6), // your price protection — required
+  fee: 500,
+});
+
+// ETH → token.
+await agent.swapFromNative({
+  tokenOut: usdc,
+  amountIn: parseEther("0.01"),
+  amountOutMinimum: minOut,
+  fee: 500,
+});
+```
+
+### Provide liquidity on Uniswap (v3 & v4)
+
+Open a position, collect its fees, and close it. The position NFT is minted **to
+the wallet** and every proceed is taken back **to the wallet** — pinned on-chain,
+same as everything else.
+
+```ts
+// v3: mint a position. amountA/amountB are the MOST you'll deposit of each token;
+// the SDK reads the pool price and sizes both sides to the ratio (one side is
+// usually only partly used). Full-range by default; pass ticks for a range.
+const mint = await agent.addLiquidityV3({
+  tokenA: weth, tokenB: usdc, fee: 500,
+  amountA: parseEther("0.01"), amountB: parseUnits("30", 6),
+  slippageBps: 50,
+});
+
+const pos = await agent.getV3Position(tokenId);        // range, liquidity, owed fees
+await agent.collectFeesV3(tokenId);                    // sweep earned fees to the wallet
+await agent.removeLiquidityV3({ tokenId, bps: 10000, burn: true }); // close + burn the NFT
+```
+
+```ts
+// v4: same shape (tokenA/tokenB), and native-ETH pools work here — pass V4_NATIVE
+// (address(0)) as a side; it's funded by msg.value, ERC-20 sides via Permit2. Needs
+// the v4 PositionManager and, for the agent, its on-chain DEEP validator active —
+// otherwise the mint fails closed.
+import { V4_NATIVE } from "@bvcc/agent-sdk";
+
+await agent.addLiquidityV4({
+  tokenA: V4_NATIVE, tokenB: usdc, fee: 500, tickSpacing: 10,
+  amountA: parseEther("0.01"), amountB: parseUnits("30", 6),
+  slippageBps: 50,
+});
+await agent.removeLiquidityV4({ tokenId, bps: 10000, burn: true });
+```
+
+One note worth knowing: there is **no `increaseLiquidity`** — the v3 NFPM's
+`increaseLiquidity` is not owner-gated, so to add you mint a fresh position rather
+than top up an existing one (v4 gates it, so v4 has it).
+
+### Lending on Aave v3
+
+Aave is wired on **Arbitrum, Ethereum, BNB Chain, Base and Polygon** (every address
+resolved on-chain from each market's PoolAddressesProvider). Everything is
+deposited, borrowed and repaid **for the wallet itself** — there is no `to` or
+`onBehalfOf` parameter, because the wallet's call policies pin the beneficiary
+on-chain.
+
+```ts
+// Where do we stand?
+const { account, positions } = {
+  account: await agent.aave.getAccountData(),  // health factor, collateral, debt
+  positions: await agent.aave.getPositions(),  // per-reserve supplied / borrowed
+};
+
+await agent.aave.supply("USDC", "100");
+await agent.aave.borrow("WETH", "0.02");
+await agent.aave.repay("WETH", "max");     // "max" clears the debt including interest
+await agent.aave.withdraw("USDC", "max");  // "max" takes the whole balance
+```
+
+### Unwinding a position (planners)
+
+Collateral backs your debt, so you cannot simply withdraw it, and you cannot repay
+because your money is locked as collateral. Without flash loans the way out is to
+work in chunks: withdraw what safety allows, swap it, repay, which frees more
+collateral, repeat.
+
+Every planner comes in pairs — `plan*` projects and sends nothing, the other runs
+the loop. **A single execute call can broadcast several transactions.**
+
+```ts
+// See what it intends to do first: how many chunks, and where health lands.
+const plan = await agent.aave.planClosePosition({ slippageBps: 100, hfFloor: "1.05" });
+console.log(plan.summary, plan.chunks.map((c) => c.description));
+
+// Then run it. Each chunk is re-derived from live state, re-checked against every
+// control and simulated before it is sent.
+const result = await agent.aave.executePlan({ kind: "closePosition", slippageBps: 100 });
+console.log(result.chunksCompleted, result.txHashes);
+
+// Also available: deleverage, and swapping the collateral or the debt asset.
+await agent.aave.planRepayWithCollateral({ collateralAsset: "USDC", debtAsset: "WETH", slippageBps: 100 });
+await agent.aave.planCollateralSwap({ fromAsset: "USDC", toAsset: "WETH", slippageBps: 100 });
+await agent.aave.planDebtSwap({ fromDebtAsset: "WETH", toDebtAsset: "USDC", slippageBps: 100 });
+```
+
+`closePosition` avoids the loop when it can: if the wallet already holds enough of
+the debt asset it repays directly, and if debt and collateral are the same asset it
+repays straight from aTokens without swapping.
+
+**The controls that make this safe to run unattended.** `slippageBps` is required;
+the rest have conservative defaults. A violation aborts with a reason you can act
+on rather than a failed transaction.
+
+| Control | Default | Stops |
+|---|---|---|
+| `hfFloor` | `"1.05"` | any chunk that would push health below it |
+| `maximumIterations` | `10` | an endless loop |
+| `maxPriceImpactBps` | `200` | swapping far off the Aave oracle price |
+| `minimumChunkAmount` | none | dust chunks that only burn gas |
+| strict progress | always | a loop that stops reducing the debt |
+| budget check | always | running out of allowance mid-way |
+
+If the position is too tight to chunk at all, the abort tells you **how much debt to
+repay from the wallet to unblock it** — not just "infeasible".
+
 ### Check before you act (saves gas)
 
 ```ts
@@ -243,22 +378,24 @@ returns an `ActionResult`.
 | Helper | Use for | Router |
 | --- | --- | --- |
 | `swapExactInputV3` | v3 pools (simplest, widely whitelisted) | SwapRouter02 |
-| `swapV4ExactIn` | v4 pools | Universal Router 2.1.1 + Permit2 |
+| `swapV4ExactIn` | v4 pools | Universal Router (canonical) + Permit2 |
 | `swapViaUniversalRouter` | v3 via the classic Universal Router | classic UR + Permit2 |
 
 The router(s) must be in the agent's `allowedProtocols` and `tokenIn` in
 `allowedTokens`; output returns to the wallet. v4 pools are keyed by
 `(fee, tickSpacing, hooks)`, so pass `tickSpacing` (e.g. USDC/WETH on Arbitrum =
-fee `500`, tickSpacing `10`). `nativeOut: true` unwraps WETH to ETH; `path`
+fee `500`, tickSpacing `10`). `nativeOut: true` routes through the **native
+(address(0)) pool** and delivers ETH straight to the wallet — no WETH, no unwrap
+leg (the agent's UR validator forbids parking output in the router). `path`
 enables multi-hop.
 
 The UR and v4 paths use **Permit2 funding**: `approve(token → Permit2)` +
 `Permit2.approve(token → router)` + `execute(... payerIsUser=true)`. Nothing is
 transferred blindly, so a wrong router address reverts instead of losing funds.
 Permit2's address is hardcoded (same on every chain); the Universal Router is
-preconfigured only on Arbitrum One — pass `router` on other chains. The v4 encoder
-is verified byte-for-byte against a real app.uniswap.org swap and validated on
-Arbitrum One.
+preconfigured on the supported chains — pass `router` for a custom endpoint. The
+v4 swap encoder uses the canonical v4-periphery `ExactInputParams` and is validated
+on-chain against the deployed Universal Router validator (Arbitrum One).
 
 Swap **execution** helpers take addresses; `buildSwapPlan`, `resolveToken`, and the
 balance helpers also accept **symbols** from the token registry. `buildSwapPlan`
@@ -267,7 +404,27 @@ never throws on quote/read failures — it returns the plan with a warning.
 ### API reference
 
 **Actions → `ActionResult`:** `sendNative` · `sendToken` · `approve` ·
-`swapExactInputV3` · `swapV4ExactIn` · `swapViaUniversalRouter` · `run`
+`swapExactInputV3` · `swapV4ExactIn` · `swapViaUniversalRouter` · `swapToNative` ·
+`swapFromNative` · `run`
+
+**Aave (`client.aave.*`):** reads `getAccountData` · `getPositions` · `getReserves`
+· `maxSafeBorrow` — writes `supply` · `withdraw` · `borrow` · `repay` ·
+`repayWithATokens` · `setCollateral` · `setEMode` — simulate `dryRunSupply` ·
+`dryRunWithdraw` · `dryRunBorrow` · `dryRunRepay`
+
+**Aave planners:** `planRepayWithCollateral` · `planClosePosition` ·
+`planCollateralSwap` · `planDebtSwap` (all projection-only) · `executePlan` (runs
+the loop; may send several transactions)
+
+**Liquidity (Uniswap v3 & v4):** `addLiquidityV3` · `removeLiquidityV3` ·
+`collectFeesV3` · `burnV3` · `getV3Position` · `planAddLiquidityV3` — and the v4
+equivalents `addLiquidityV4` · `removeLiquidityV4` · `collectFeesV4` · `burnV4` ·
+`getV4Position` · `planAddLiquidityV4` (native-ETH pools). Simulate with
+`dryRunAddLiquidityV3/V4` · `dryRunRemoveLiquidityV3/V4`.
+
+**V3 call policies:** `getPolicy` · `decodePolicy` · `describePolicy` ·
+`diagnosePolicy` · `detectWalletVersion` · `getActiveValidator` ·
+`wouldPassDeepValidation`
 
 **Low-level:** `execute` → `Hex` · `executeAndWait` → receipt · `build*` →
 `Execution[]` · `encodeExecutions`
@@ -287,6 +444,11 @@ never throws on quote/read failures — it returns the plan with a warning.
 **Exported helpers:** `decodeRevert` · `resolveToken` · `TOKENS` · `applySlippage`
 · `quoteV3ExactInputSingle` · `quoteV4ExactInputSingle` · `NETWORKS` · viem
 re-exports (`parseEther`, `formatUnits`, …).
+
+**Guides:** `listGuides()` · `getGuide(area)` · `GUIDES` — on-demand how-to
+playbooks (`getting-started`, `swaps`, `lending`, `liquidity`) with the recommended
+workflow and gotchas per area. Also surfaced as the `listGuides`/`getGuide`
+capabilities so wrappers expose them as tools/prompts.
 
 ### Networks, tokens & fees
 
@@ -311,6 +473,11 @@ runtime may invoke. Wrappers (the [`@bvcc/agent-mcp`](https://www.npmjs.com/pack
 MCP server, and future OpenClaw / ElizaOS adapters) generate their tools from it,
 so an action is described once and every runtime gets it. Importing the core SDK
 does **not** pull in the catalog or Zod.
+
+The catalog also carries two always-on help capabilities, `listGuides` and
+`getGuide`, that return per-area operating guides (workflow + gotchas). A wrapper
+surfaces them as tools, and can also expose them as prompts — the MCP server
+registers one `guide-<area>` prompt per area.
 
 ## License
 
