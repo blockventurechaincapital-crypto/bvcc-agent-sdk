@@ -134,6 +134,31 @@ const ENTRIES: Entry[] = [
   // Whitelisting a protocol is no longer enough — each (target, selector) needs a
   // policy, and a policy can pin calldata words to the wallet. These reverts mean
   // the policy layer stopped the call, not the permission layer.
+  // ── Wallet V4 ─────────────────────────────────────────────────────────────
+  {
+    name: "AgentMustBeEOA",
+    signature: "AgentMustBeEOA()",
+    humanMessage:
+      "The agent address carries contract code. V4 re-checks this on every execution, not just when the agent was authorized, so an address that gained code afterwards — typically an EIP-7702 delegation — is refused.",
+    suggestedAction:
+      "Remove the EIP-7702 delegation from the agent address, or authorize a fresh key that has none. Retrying will not help while the code is there.",
+  },
+  {
+    name: "TokenCallWithValue",
+    signature: "TokenCallWithValue()",
+    humanMessage:
+      "A transfer or approve was sent carrying native value. V4 requires token calls to carry zero value, because the parent would otherwise forward the ETH to the token contract, outside the recipient whitelist.",
+    suggestedAction:
+      "Set value to 0 on the transfer/approve call. Send native value as its own separate execution.",
+  },
+  {
+    name: "ReentrantAgentExecute",
+    signature: "ReentrantAgentExecute()",
+    humanMessage:
+      "Something called execute() on the wallet while an agent batch was already running. V4 refuses that, which closes a reentrancy that let a compromised agent bypass every limit.",
+    suggestedAction:
+      "Do not have a batch target the agent's own address or any contract that calls back into the wallet. If this appeared unexpectedly, treat it as hostile calldata rather than retrying.",
+  },
   {
     name: "SelectorNotAllowed",
     signature: "SelectorNotAllowed()",

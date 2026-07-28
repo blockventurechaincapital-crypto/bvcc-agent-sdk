@@ -4,6 +4,33 @@ All notable changes to `@bvcc/agent-sdk` are documented here. This project follo
 [Semantic Versioning](https://semver.org/). While on `0.x`, the public API may
 change between minor versions.
 
+## [0.2.1] — 2026-07-28
+
+### Added
+- **Wallet V4 awareness.** `detectWalletVersion` now returns `"v4"`, read from the wallet's
+  own EIP-712 domain (every generation names it `BVCCSmartWalletV<n>`). The probe for
+  `getCallPolicy` still separates V2 from the policy-aware generations; the domain
+  separates those from each other.
+- The three V4 reverts decode to actionable messages:
+  - `AgentMustBeEOA` — V4 re-checks that the agent address carries no code on **every**
+    execution, not only at authorization. An agent that later gained an EIP-7702
+    delegation stops working until it is removed; the message says so and says not to
+    retry.
+  - `TokenCallWithValue` — a transfer/approve may no longer carry native value.
+  - `ReentrantAgentExecute` — something called `execute()` while an agent batch was in
+    flight. Flagged as hostile calldata rather than something to retry.
+
+### Changed
+- **Capability gating now tests `walletVersion !== "v2"`** instead of `=== "v3"`, so the
+  call-policy checks apply to V4 and to any later generation. Behaviour on V2 and V3
+  wallets is unchanged.
+- `WalletVersion` and `getCapabilities().walletVersion` widen to `"v2" | "v3" | "v4"`.
+  Code that switches exhaustively on the union will need the new arm.
+
+### Notes
+- V4 factories are live on all six networks. The SDK operates on a wallet address, so
+  nothing needs reconfiguring to use V4 wallets.
+
 ## [0.2.0] — 2026-07-21
 
 ### Added

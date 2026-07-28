@@ -1279,7 +1279,8 @@ export class BvccAgentClient {
     let policyOkV4 = true;
     const missingPolicies: MissingPolicy[] = [];
 
-    if (walletVersion === "v3") {
+    // Every generation from V3 on has the call-policy layer.
+    if (walletVersion !== "v2") {
       const registry = this.network.validatorRegistry;
       const router = this.network.swapRouter02;
       const ur = this.network.universalRouter;

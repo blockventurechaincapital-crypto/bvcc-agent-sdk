@@ -114,7 +114,7 @@ export interface Capabilities {
    * Which wallet generation this is. V3 enforces call policies on top of the
    * permission struct; V2 does not, so the policy fields below stay empty there.
    */
-  walletVersion?: "v2" | "v3";
+  walletVersion?: "v2" | "v3" | "v4";
   /**
    * Policies an action needs but that are not registered. Non-empty means the
    * matching `can*` flag is false for a reason the permission struct alone would

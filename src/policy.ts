@@ -43,7 +43,7 @@ const PIN_PROTOCOL_SHIFT = 160n;
 const BITMAP_WIDTH = 32;
 
 /** Which wallet generation a given address is. */
-export type WalletVersion = "v2" | "v3";
+export type WalletVersion = "v2" | "v3" | "v4";
 
 /** A policy word, decoded into what it actually enforces. */
 export interface DecodedPolicy {
@@ -100,10 +100,14 @@ export function describePolicy(p: DecodedPolicy): string {
 /**
  * Which wallet generation lives at `wallet`.
  *
- * `walletType()` cannot answer this — it returns 1 for an agent wallet in BOTH V2
- * and V3. So we probe `getCallPolicy`, which only exists on V3: on V2 the call
- * hits no function and reverts. A harmless zero-argument read is used, and the
- * result is cached because a deployed wallet never changes generation.
+ * `walletType()` cannot answer this — it returns 1 for an agent wallet in every
+ * generation. So we probe `getCallPolicy`, which V2 does not have: on V2 the call hits
+ * no function and reverts. That separates V2 from the policy-aware generations; the
+ * EIP-712 domain then separates those, since each release names it BVCCSmartWalletV<n>.
+ * Cached because a deployed wallet never changes generation.
+ *
+ * Callers gating on the policy layer should test `!== "v2"` rather than a specific
+ * version, so a future generation does not silently skip the check.
  */
 const versionCache = new Map<string, WalletVersion>();
 
@@ -123,13 +127,21 @@ export async function detectWalletVersion(
       functionName: "getCallPolicy",
       args: ["0x0000000000000000000000000000000000000000", "0x00000000"],
     });
+    // Policy-aware. Ask the wallet which generation it actually is.
     version = "v3";
+    try {
+      const { domain } = await publicClient.getEip712Domain({ address: wallet });
+      const m = /^BVCCSmartWalletV(\d+)$/.exec(domain.name ?? "");
+      if (m && Number(m[1]) >= 4) version = "v4";
+    } catch {
+      // Domain unreadable: stay on the conservative label, the policy layer is there.
+    }
   } catch {
     // Absent function on V2. A transport failure would land here too, so this is
     // deliberately not cached as a negative result below.
     version = "v2";
   }
-  if (version === "v3") versionCache.set(key, version);
+  if (version !== "v2") versionCache.set(key, version);
   return version;
 }
 
