@@ -4,6 +4,21 @@ All notable changes to `@bvcc/agent-sdk` are documented here. This project follo
 [Semantic Versioning](https://semver.org/). While on `0.x`, the public API may
 change between minor versions.
 
+## [0.2.2] — 2026-07-30
+
+Maintenance release. **No API change and no behaviour change** — `src/` is byte-identical
+to 0.2.1.
+
+### Fixed
+- `package-lock.json` still declared `0.1.3` while the package was published as `0.2.1`.
+  It is a repository artifact — npm never ships a lockfile in the tarball, so no install
+  was ever affected — but it made the repository state misleading.
+
+### Changed
+- Version raised to match `@bvcc/agent-mcp` 0.2.2, which bundles this release. The MCP
+  inlines the SDK at build time rather than resolving it from npm, so pairing the version
+  numbers is the simplest way to tell which SDK is inside a given MCP build.
+
 ## [0.2.1] — 2026-07-28
 
 ### Added
