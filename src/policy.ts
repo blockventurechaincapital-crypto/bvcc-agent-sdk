@@ -18,7 +18,7 @@
  */
 import type { Address, Hex, PublicClient } from "viem";
 
-import { agentWalletAbi, validatorRegistryAbi } from "./abi.js";
+import { agentWalletAbi, agentWalletV5Abi, validatorRegistryAbi, validatorRegistryV5Abi } from "./abi.js";
 
 /**
  * Selectors the swap helpers need a policy for, on V3 wallets.
@@ -43,7 +43,12 @@ const PIN_PROTOCOL_SHIFT = 160n;
 const BITMAP_WIDTH = 32;
 
 /** Which wallet generation a given address is. */
-export type WalletVersion = "v2" | "v3" | "v4";
+export type WalletVersion = "v2" | "v3" | "v4" | "v5";
+
+/** True for the generations whose policies, limits and errors follow the V5 rules. */
+export function isV5(version: WalletVersion): boolean {
+  return version === "v5";
+}
 
 /** A policy word, decoded into what it actually enforces. */
 export interface DecodedPolicy {
@@ -120,38 +125,63 @@ export async function detectWalletVersion(
   if (cached) return cached;
 
   let version: WalletVersion;
+  // V5 dropped the wallet-wide `getCallPolicy` (policies are per agent there), so the
+  // EIP-712 domain is asked first: every generation names it `BVCCSmartWalletV<n>`.
+  let domainGen: number | null = null;
   try {
-    await publicClient.readContract({
-      address: wallet,
-      abi: agentWalletAbi,
-      functionName: "getCallPolicy",
-      args: ["0x0000000000000000000000000000000000000000", "0x00000000"],
-    });
-    // Policy-aware. Ask the wallet which generation it actually is.
-    version = "v3";
-    try {
-      const { domain } = await publicClient.getEip712Domain({ address: wallet });
-      const m = /^BVCCSmartWalletV(\d+)$/.exec(domain.name ?? "");
-      if (m && Number(m[1]) >= 4) version = "v4";
-    } catch {
-      // Domain unreadable: stay on the conservative label, the policy layer is there.
-    }
+    const { domain } = await publicClient.getEip712Domain({ address: wallet });
+    const m = /^BVCCSmartWalletV(\d+)$/.exec(domain.name ?? "");
+    if (m) domainGen = Number(m[1]);
   } catch {
-    // Absent function on V2. A transport failure would land here too, so this is
-    // deliberately not cached as a negative result below.
-    version = "v2";
+    // Domain unreadable: fall back to probing the policy layer below.
+  }
+  if (domainGen !== null && domainGen >= 5) {
+    version = "v5";
+  } else {
+    try {
+      await publicClient.readContract({
+        address: wallet,
+        abi: agentWalletAbi,
+        functionName: "getCallPolicy",
+        args: ["0x0000000000000000000000000000000000000000", "0x00000000"],
+      });
+      // Policy-aware: V3, or V4 when the domain says so.
+      version = domainGen !== null && domainGen >= 4 ? "v4" : "v3";
+    } catch {
+      // Absent function on V2. A transport failure would land here too, so this is
+      // deliberately not cached as a negative result below.
+      version = "v2";
+    }
   }
   if (version !== "v2") versionCache.set(key, version);
   return version;
 }
 
-/** Read one policy word. Returns 0n on V2 wallets, where policies do not exist. */
+/**
+ * Read one policy word. Returns 0n on V2 wallets, where policies do not exist.
+ *
+ * V5 keeps one policy per agent: pass `agent` there. Without it a V5 wallet reads
+ * as "no policy", which is the safe answer.
+ */
 export async function readCallPolicy(
   publicClient: PublicClient,
   wallet: Address,
   target: Address,
   selector: Hex,
+  agent?: Address,
 ): Promise<bigint> {
+  if (agent) {
+    try {
+      return (await publicClient.readContract({
+        address: wallet,
+        abi: agentWalletV5Abi,
+        functionName: "getAgentCallPolicy",
+        args: [agent, target, selector],
+      })) as bigint;
+    } catch {
+      // Not V5: read the wallet-wide policy below.
+    }
+  }
   try {
     return (await publicClient.readContract({
       address: wallet,
@@ -170,8 +200,9 @@ export async function getPolicy(
   wallet: Address,
   target: Address,
   selector: Hex,
+  agent?: Address,
 ): Promise<DecodedPolicy> {
-  return decodePolicy(await readCallPolicy(publicClient, wallet, target, selector));
+  return decodePolicy(await readCallPolicy(publicClient, wallet, target, selector, agent));
 }
 
 /**
@@ -237,9 +268,9 @@ export async function diagnosePolicy(
   wallet: Address,
   target: Address,
   selector: Hex,
-  opts: { registry?: Address; value?: bigint; data?: Hex } = {},
+  opts: { registry?: Address; value?: bigint; data?: Hex; agent?: Address } = {},
 ): Promise<PolicyDiagnosis> {
-  const policy = await getPolicy(publicClient, wallet, target, selector);
+  const policy = await getPolicy(publicClient, wallet, target, selector, opts.agent);
 
   if (!policy.allowed) {
     return {
@@ -287,6 +318,7 @@ export async function diagnosePolicy(
         target,
         opts.value ?? 0n,
         opts.data,
+        opts.agent,
       );
       if (!passes) {
         return {
@@ -325,7 +357,22 @@ export async function wouldPassDeepValidation(
   target: Address,
   value: bigint,
   data: Hex,
+  agent?: Address,
 ): Promise<boolean> {
+  if (agent) {
+    // V5 registry: validate(agent, wallet, target, value, data) -> (ok, ...).
+    try {
+      const r = (await publicClient.readContract({
+        address: registry,
+        abi: validatorRegistryV5Abi,
+        functionName: "validate",
+        args: [agent, wallet, target, value, data],
+      })) as readonly [boolean, ...unknown[]];
+      return r[0];
+    } catch {
+      // Not a V5 registry: ask the V4 one below.
+    }
+  }
   try {
     return (await publicClient.readContract({
       address: registry,

@@ -61,6 +61,11 @@ export interface TokenToNativeParams {
   /** Cap on tokenIn spent. */
   amountInMaximum: bigint;
   fee?: number;
+  /**
+   * Wallet V5 charges the agent fee on top of what leaves, not out of what arrives:
+   * size the swap to the exact amount, with nothing extra for the fee.
+   */
+  feeOnTop?: boolean;
 }
 
 /**
@@ -72,7 +77,7 @@ export interface TokenToNativeParams {
  * and the unwrap then takes exactly `amountOut`.
  */
 export function buildTokenToNative(p: TokenToNativeParams): Execution[] {
-  const gross = grossForNet(p.amountOut);
+  const gross = p.feeOnTop ? p.amountOut : grossForNet(p.amountOut);
   const swapData = encodeFunctionData({
     abi: swapRouter02Abi,
     functionName: "exactOutputSingle",
@@ -108,6 +113,8 @@ export interface NativeToTokenParams {
   amountIn: bigint;
   amountOutMinimum: bigint;
   fee?: number;
+  /** Wallet V5: the deposit keeps the full amount (the fee is charged on top in ETH). */
+  feeOnTop?: boolean;
 }
 
 /**
@@ -118,7 +125,7 @@ export interface NativeToTokenParams {
  * not to the ETH sent, or the batch reverts for insufficient balance.
  */
 export function buildNativeToToken(p: NativeToTokenParams): Execution[] {
-  const swappable = netOfFee(p.amountIn);
+  const swappable = p.feeOnTop ? p.amountIn : netOfFee(p.amountIn);
   const swapData = encodeFunctionData({
     abi: swapRouter02Abi,
     functionName: "exactInputSingle",

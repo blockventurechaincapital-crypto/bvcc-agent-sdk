@@ -14,7 +14,13 @@ export interface Execution {
 
 /**
  * On-chain permission set for an agent, mirroring the contract's
- * `AgentPermission` struct. In every limit, `0` means unlimited / disabled.
+ * `AgentPermission` struct.
+ *
+ * The meaning of a limit depends on the wallet generation:
+ *   - V2–V4: `0` means unlimited / disabled.
+ *   - V5: `0` means nothing is allowed, and `type(uint128).max` means unlimited. An
+ *     empty `allowedRecipients` means no recipient. Limits include the 0.15% agent fee.
+ * On V5 the spending fields are filled from `getAgentSpending`.
  */
 export interface AgentPermission {
   maxPerTxWei: bigint;
@@ -33,6 +39,8 @@ export interface AgentPermission {
   periodDuration: bigint;
   periodStart: bigint;
   active: boolean;
+  /** V5 only: this agent alone is paused by the owner. Always false before V5. */
+  paused?: boolean;
 }
 
 /** Per-token budget snapshot, derived from the on-chain permission + spend. */
@@ -50,8 +58,9 @@ export interface TokenBudget {
 }
 
 /**
- * Computed remaining headroom for an agent. `null` for any limit set to 0
- * (unlimited / disabled) on-chain.
+ * Computed remaining headroom for an agent. `null` means that limit does not
+ * restrict: a 0 limit before V5, `type(uint128).max` on V5. On V5 a 0 limit reads
+ * as `0n` remaining — nothing is allowed.
  */
 export interface RemainingBudget {
   active: boolean;
@@ -83,6 +92,8 @@ export interface AgentStatus {
   isPaused: boolean;
   /** Unix seconds; 0 = never expires. */
   expiry: bigint;
+  /** Wallet generation, when known. */
+  walletVersion?: "v2" | "v3" | "v4" | "v5";
   allowedTokens: readonly Address[];
   allowedProtocols: readonly Address[];
   allowedRecipients: readonly Address[];
@@ -107,6 +118,10 @@ export interface Capabilities {
   canApprove: boolean;
   canSwapV3: boolean;
   canSwapV4: boolean;
+  /** Wallet V5: Uniswap v3 liquidity is usable (validator active, policy set, not blocked). */
+  canProvideLiquidityV3?: boolean;
+  /** Wallet V5: wrapping / unwrapping the native coin is usable (validator active, policy set). */
+  canWrapNative?: boolean;
   allowedSwapTokens: readonly Address[];
   allowedProtocols: readonly Address[];
   notes: string[];
@@ -114,7 +129,7 @@ export interface Capabilities {
    * Which wallet generation this is. V3 enforces call policies on top of the
    * permission struct; V2 does not, so the policy fields below stay empty there.
    */
-  walletVersion?: "v2" | "v3" | "v4";
+  walletVersion?: "v2" | "v3" | "v4" | "v5";
   /**
    * Policies an action needs but that are not registered. Non-empty means the
    * matching `can*` flag is false for a reason the permission struct alone would

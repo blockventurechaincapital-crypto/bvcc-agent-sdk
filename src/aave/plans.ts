@@ -91,6 +91,15 @@ const fromBase = (base: bigint, priceBase: bigint, decimals: number) =>
 
 const priceOf = (r: AaveReserveInfo) => BigInt(Math.round(Number(r.priceUsd) * 1e8));
 
+/**
+ * The router a plan's swaps actually reach. On wallet V5 SwapRouter02 calls are sent
+ * through the Universal Router (see `adaptBatchForV5`), so that is what the agent needs.
+ */
+async function swapRouterFor(client: BvccAgentClient, swapRouter02: Address): Promise<Address> {
+  if ((await client.walletVersion()) === "v5" && client.network.universalRouter) return client.network.universalRouter;
+  return swapRouter02;
+}
+
 async function loadContext(client: BvccAgentClient, assets: string[]) {
   const chainId = client.network.chainId;
   const addrs = getAaveAddresses(chainId);
@@ -283,7 +292,7 @@ export async function planRepayWithCollateral(
     kind: "repayWithCollateral",
     strategy: "chunked",
     chunks,
-    requiredProtocols: [addrs.pool, router],
+    requiredProtocols: [addrs.pool, await swapRouterFor(client, router)],
     requiredTokens: [collAddr, debtAddr],
     requiredBudgets: [
       { token: collAddr, symbol: collRes.symbol ?? "", amount: collApprovals },
@@ -398,6 +407,15 @@ export async function planClosePosition(
   // Route 2 — debt and collateral are the same asset: burn aTokens against it.
   // No swap, and no BVCC fee at all (nothing enters the wallet).
   const sameAsset = collaterals.find((c) => c.asset.toLowerCase() === debt.asset.toLowerCase());
+  if (sameAsset && sameAsset.supplied >= debt.variableDebt && (await client.walletVersion()) === "v5") {
+    // repayWithATokens is not available to agents on wallet V5.
+    return emptyPlan(
+      "closePosition",
+      controls,
+      "Debt and collateral are the same asset, which this plan closes with repayWithATokens — not available to agents on wallet V5. " +
+        "Repay in steps instead (aaveWithdraw a part of the collateral, then aaveRepay it), keeping the health factor above 1.2, or let the owner close it from the dashboard.",
+    );
+  }
   if (sameAsset && sameAsset.supplied >= debt.variableDebt) {
     const executions: Execution[] = [
       ...buildRepayWithATokens(addrs.pool, debt.asset, "max"),
@@ -625,7 +643,7 @@ export async function planCollateralSwap(
     kind: "collateralSwap",
     strategy: "chunked",
     chunks,
-    requiredProtocols: [addrs.pool, router],
+    requiredProtocols: [addrs.pool, await swapRouterFor(client, router)],
     requiredTokens: [fromAddr, toAddr],
     requiredBudgets: [
       { token: fromAddr, symbol: fromRes.symbol ?? "", amount: fromApprovals },
@@ -794,7 +812,7 @@ export async function planDebtSwap(
     kind: "debtSwap",
     strategy: "chunked",
     chunks,
-    requiredProtocols: [addrs.pool, router],
+    requiredProtocols: [addrs.pool, await swapRouterFor(client, router)],
     requiredTokens: [fromAddr, toAddr],
     requiredBudgets: [
       { token: toAddr, symbol: toRes.symbol ?? "", amount: toApprovals },

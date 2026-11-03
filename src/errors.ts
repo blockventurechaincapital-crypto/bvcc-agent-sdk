@@ -18,6 +18,12 @@ export interface DecodedRevert {
   suggestedAction: string;
   /** Selector or a short, non-sensitive summary. Never contains secrets. */
   rawError: string;
+  /**
+   * Whether sending the same call again could succeed. `false` means it will fail
+   * the same way until something changes (amount, balance, the owner's settings, a
+   * daily reset): do not repeat it with the same parameters.
+   */
+  retryable: boolean;
 }
 
 interface Entry {
@@ -25,6 +31,8 @@ interface Entry {
   signature: string;
   humanMessage: string;
   suggestedAction: string;
+  /** Default false: the same call fails again until something changes. */
+  retryable?: boolean;
 }
 
 const ENTRIES: Entry[] = [
@@ -190,6 +198,202 @@ const ENTRIES: Entry[] = [
     humanMessage: "The call data is too short to contain a function selector.",
     suggestedAction: "Build the call with a proper 4-byte selector and ABI-encoded arguments.",
   },
+  // ── Wallet V5 ──────────────────────────────────────────────────────────────
+  {
+    name: "AgentPaused",
+    signature: "AgentPaused()",
+    humanMessage: "The owner has paused this agent (wallet V5). Other agents may still run.",
+    suggestedAction: "Wait until the owner resumes the agent from the dashboard. Retrying will not help.",
+  },
+  {
+    name: "TargetIsBlocked",
+    signature: "TargetIsBlocked()",
+    humanMessage: "The owner has blocked this contract for every agent (wallet V5).",
+    suggestedAction: "Do not call this contract. Only the owner can unblock it.",
+  },
+  {
+    name: "PostCheckFailed",
+    signature: "PostCheckFailed()",
+    humanMessage:
+      "A validator's check after the batch failed — for Aave, the health factor would end below 1.2 (wallet V5).",
+    suggestedAction: "Use a smaller amount so the position stays healthy, then retry.",
+  },
+  {
+    name: "CallNeedsValidator",
+    signature: "CallNeedsValidator()",
+    humanMessage: "On wallet V5 every call to a protocol needs a validator, and this one has none.",
+    suggestedAction: "Use the supported routes: Universal Router swaps, Uniswap v4 liquidity or Aave. Retrying will not help.",
+  },
+  {
+    name: "UnsupportedExecutionMode",
+    signature: "UnsupportedExecutionMode()",
+    humanMessage: "Wallet V5 only accepts agent batches in batch mode.",
+    suggestedAction: "Send the calls with executeAsAgent in batch mode (the SDK does this for you).",
+  },
+  {
+    name: "TotalBudgetExceeded",
+    signature: "TotalBudgetExceeded()",
+    humanMessage: "This would exceed the agent's lifetime ETH budget (the 0.15% fee counts too).",
+    suggestedAction: "Reduce the amount, or ask the owner to raise the agent's total budget.",
+  },
+  {
+    name: "UnknownAgent",
+    signature: "UnknownAgent()",
+    humanMessage: "This address has never been an agent of the wallet.",
+    suggestedAction: "Check WALLET_ADDRESS and the agent key, or ask the owner to authorize this agent.",
+  },
+  {
+    name: "MeasurementFailed",
+    signature: "MeasurementFailed()",
+    humanMessage: "The wallet could not read a token balance it needs to measure the batch.",
+    suggestedAction: "Remove the unusual token from the batch. Retrying the same batch will not help.",
+  },
+  {
+    name: "TooManyMeasuredTokens",
+    signature: "TooManyMeasuredTokens()",
+    humanMessage: "The batch touches more tokens than the wallet can measure at once.",
+    suggestedAction: "Split the batch into smaller ones.",
+  },
+  {
+    name: "TokenCallFailed",
+    signature: "TokenCallFailed()",
+    humanMessage: "A token transfer or approve inside the batch failed.",
+    suggestedAction: "Check the token balance and the amount, then retry.",
+  },
+  {
+    name: "InsufficientBalanceForFee",
+    signature: "InsufficientBalanceForFee()",
+    humanMessage: "The wallet does not hold enough to pay the 0.15% agent fee on top of the amount.",
+    suggestedAction: "Lower the amount slightly so the fee fits in the balance.",
+  },
+  {
+    name: "ETHFeeFailed",
+    signature: "ETHFeeFailed()",
+    humanMessage: "The ETH fee could not be paid.",
+    suggestedAction: "Leave some ETH in the wallet for the fee and retry.",
+  },
+  {
+    name: "FeeTransferFailed",
+    signature: "FeeTransferFailed()",
+    humanMessage: "The token fee could not be paid.",
+    suggestedAction: "Check that the wallet still holds the token, then retry.",
+  },
+  {
+    name: "ReentrancyGuardReentrantCall",
+    signature: "ReentrancyGuardReentrantCall()",
+    humanMessage: "A call in the batch tried to re-enter the wallet.",
+    suggestedAction: "Treat the calldata as hostile; do not retry it.",
+  },
+  {
+    name: "OnlyWallet",
+    signature: "OnlyWallet()",
+    humanMessage: "Only the wallet owner can call this function.",
+    suggestedAction: "Agents cannot change their own permissions. Ask the owner.",
+  },
+  {
+    name: "ERC7579DecodingError",
+    signature: "ERC7579DecodingError()",
+    humanMessage: "The batch data could not be decoded.",
+    suggestedAction: "Encode the batch as abi.encode(Execution[]) (the SDK does this for you).",
+  },
+  // ── Uniswap routers ────────────────────────────────────────────────────────
+  {
+    name: "TransactionDeadlinePassed",
+    retryable: true,
+    signature: "TransactionDeadlinePassed()",
+    humanMessage: "The swap's deadline had already passed when it reached the chain.",
+    suggestedAction: "Rebuild the swap and send it again. If it keeps happening, the computer's clock is probably behind.",
+  },
+  {
+    name: "DeadlinePassed",
+    retryable: true,
+    signature: "DeadlinePassed(uint256)",
+    humanMessage: "The liquidity call's deadline had already passed when it reached the chain.",
+    suggestedAction: "Rebuild the call and send it again. If it keeps happening, the computer's clock is probably behind.",
+  },
+  {
+    name: "V3TooLittleReceived",
+    retryable: true,
+    signature: "V3TooLittleReceived()",
+    humanMessage: "The swap would return less than the minimum you set (price moved or the pool is thin).",
+    suggestedAction: "Re-quote, then retry with a fresh minimum or a smaller amount.",
+  },
+  {
+    name: "V3TooMuchRequested",
+    retryable: true,
+    signature: "V3TooMuchRequested()",
+    humanMessage: "The exact-output swap would cost more than the maximum input you set.",
+    suggestedAction: "Re-quote, then retry with a higher maximum input or a smaller output.",
+  },
+  {
+    name: "V3InvalidSwap",
+    signature: "V3InvalidSwap()",
+    humanMessage: "The router found no usable pool for this path (wrong fee tier, or the pool does not exist).",
+    suggestedAction: "Check the fee tier and the tokens of the path, then retry.",
+  },
+  {
+    name: "V4TooLittleReceived",
+    retryable: true,
+    signature: "V4TooLittleReceived(uint256,uint256)",
+    humanMessage: "The v4 swap would return less than the minimum you set.",
+    suggestedAction: "Re-quote, then retry with a fresh minimum or a smaller amount.",
+  },
+  // ── Aave v3 (named errors, v3.3 and later) ─────────────────────────────────
+  {
+    name: "NoDebtOfSelectedType",
+    signature: "NoDebtOfSelectedType()",
+    humanMessage: "There is no debt of this type to repay.",
+    suggestedAction: "Check getAavePositions before repaying. Do not repeat this repay.",
+  },
+  {
+    name: "HealthFactorLowerThanLiquidationThreshold",
+    signature: "HealthFactorLowerThanLiquidationThreshold()",
+    humanMessage: "Aave refused: the position's health factor would fall below the liquidation threshold.",
+    suggestedAction: "Repay debt or add collateral first, or use a smaller amount.",
+  },
+  {
+    name: "CollateralCannotCoverNewBorrow",
+    signature: "CollateralCannotCoverNewBorrow()",
+    humanMessage: "Aave refused: the collateral cannot cover this new borrow.",
+    suggestedAction: "Borrow less, or supply more collateral first.",
+  },
+  {
+    name: "CollateralBalanceIsZero",
+    signature: "CollateralBalanceIsZero()",
+    humanMessage: "Aave refused: the wallet has no collateral enabled.",
+    suggestedAction: "Supply an asset and keep it enabled as collateral before borrowing.",
+  },
+  {
+    name: "UnderlyingBalanceZero",
+    signature: "UnderlyingBalanceZero()",
+    humanMessage: "Aave refused: nothing of this asset is supplied.",
+    suggestedAction: "Check getAavePositions; there is nothing to withdraw or toggle here.",
+  },
+  {
+    name: "NotEnoughAvailableUserBalance",
+    signature: "NotEnoughAvailableUserBalance()",
+    humanMessage: "Aave refused: the amount is more than what is supplied.",
+    suggestedAction: "Withdraw at most the supplied amount (or pass \"max\").",
+  },
+  {
+    name: "InvalidAmount",
+    signature: "InvalidAmount()",
+    humanMessage: "Aave refused the amount (zero, or nothing to act on).",
+    suggestedAction: "Check getAavePositions and use a positive amount that exists.",
+  },
+  // ── Permit2 (the owner grants these on wallet V5) ────────────────────────────
+  {
+    name: "AllowanceExpired",
+    signature: "AllowanceExpired(uint256)",
+    humanMessage: "The Permit2 allowance for this swap or position has expired.",
+    suggestedAction: "On wallet V5 the owner grants it: ask them to renew the agent, which renews the allowance.",
+  },
+  {
+    name: "InsufficientAllowance",
+    signature: "InsufficientAllowance(uint256)",
+    humanMessage: "The Permit2 allowance for this token is missing or too small.",
+    suggestedAction: "On wallet V5 the owner grants it when authorizing or renewing the agent. Ask them to do so.",
+  },
 ];
 
 const bySelector = new Map<string, Entry>();
@@ -204,7 +408,8 @@ for (const e of ENTRIES) {
 }
 
 /** Error-fragment ABI so viem can name these reverts during `simulateContract`. */
-export const agentErrorAbi = ENTRIES.map((e) => ({
+// Only argument-free errors: an ABI fragment with the wrong inputs would carry the wrong selector.
+export const agentErrorAbi = ENTRIES.filter((e) => e.signature.endsWith("()")).map((e) => ({
   type: "error" as const,
   name: e.name,
   inputs: [] as const,
@@ -298,6 +503,30 @@ function decodeStandardRevert(dataHex?: string): string | undefined {
   return undefined;
 }
 
+/**
+ * Short string reverts with a known meaning: Uniswap's TransferHelper codes and
+ * Aave's numeric error codes (Aave releases before v3.3 revert with these).
+ */
+const STRING_REASONS: Record<string, { name: string; humanMessage: string; suggestedAction: string }> = {
+  STF: {
+    name: "STF",
+    humanMessage: "Uniswap could not pull the input token: the wallet does not hold enough of it (or the allowance is missing).",
+    suggestedAction: "Check getTokenBalances first and swap at most what the wallet holds. Do not repeat the same swap.",
+  },
+  TF: {
+    name: "TF",
+    humanMessage: "Uniswap could not transfer a token out.",
+    suggestedAction: "Check the balances and the amounts before trying again.",
+  },
+  "26": { name: "Aave:INVALID_AMOUNT", humanMessage: "Aave refused the amount (zero, or nothing to act on).", suggestedAction: "Check getAavePositions and use a positive amount that exists." },
+  "32": { name: "Aave:NOT_ENOUGH_AVAILABLE_USER_BALANCE", humanMessage: "Aave refused: the amount is more than what is supplied.", suggestedAction: 'Withdraw at most the supplied amount (or pass "max").' },
+  "34": { name: "Aave:COLLATERAL_BALANCE_IS_ZERO", humanMessage: "Aave refused: the wallet has no collateral enabled.", suggestedAction: "Supply an asset and keep it enabled as collateral before borrowing." },
+  "35": { name: "Aave:HEALTH_FACTOR_LOWER_THAN_LIQUIDATION_THRESHOLD", humanMessage: "Aave refused: the health factor would fall below the liquidation threshold.", suggestedAction: "Repay debt or add collateral first, or use a smaller amount." },
+  "36": { name: "Aave:COLLATERAL_CANNOT_COVER_NEW_BORROW", humanMessage: "Aave refused: the collateral cannot cover this new borrow.", suggestedAction: "Borrow less, or supply more collateral first." },
+  "39": { name: "Aave:NO_DEBT_OF_SELECTED_TYPE", humanMessage: "There is no debt of this type to repay.", suggestedAction: "Check getAavePositions before repaying. Do not repeat this repay." },
+  "43": { name: "Aave:UNDERLYING_BALANCE_ZERO", humanMessage: "Aave refused: nothing of this asset is supplied.", suggestedAction: "Check getAavePositions; there is nothing to withdraw or toggle here." },
+};
+
 /** Keep raw error compact and free of anything sensitive. */
 function clip(s: string): string {
   return s.length > 160 ? s.slice(0, 160) : s;
@@ -308,6 +537,10 @@ function clip(s: string): string {
  * value) into a structured, human-readable explanation.
  */
 export function decodeRevert(error: unknown): DecodedRevert {
+  // Errors the SDK raises itself carry their explanation (e.g. "not available on V5").
+  if (error && typeof error === "object" && "bvccDecoded" in error) {
+    return (error as { bvccDecoded: DecodedRevert }).bvccDecoded;
+  }
   const { dataHex, errorName, embedded, raw } = scan(error);
   const dataSelector = dataHex ? dataHex.slice(0, 10) : undefined;
 
@@ -315,8 +548,12 @@ export function decodeRevert(error: unknown): DecodedRevert {
   // "Price slippage check") — surface it verbatim.
   const reason = decodeStandardRevert(dataHex);
   if (reason && dataSelector === SELECTOR_STRING_ERROR) {
+    const known = STRING_REASONS[reason.trim()];
+    if (known)
+      return { errorName: known.name, humanMessage: known.humanMessage, suggestedAction: known.suggestedAction, rawError: clip(reason), retryable: false };
     const isSlippage = /slippage|price/i.test(reason);
     return {
+      retryable: isSlippage,
       errorName: null,
       humanMessage: `The call reverted: "${reason}".`,
       suggestedAction: isSlippage
@@ -348,6 +585,7 @@ export function decodeRevert(error: unknown): DecodedRevert {
       suggestedAction: entry.suggestedAction,
       // Prefer the authoritative data selector; else the matched error's own selector.
       rawError: dataSelector ?? toFunctionSelector(entry.signature).toLowerCase(),
+      retryable: entry.retryable ?? false,
     };
   }
 
@@ -360,6 +598,8 @@ export function decodeRevert(error: unknown): DecodedRevert {
     suggestedAction:
       "Run a dry-run/simulation, verify allowances and whitelists, or inspect the contract on the explorer.",
     rawError,
+    // A panic is a deterministic bug; anything else unknown cannot be judged here.
+    retryable: !/^Panic\(/.test(rawError),
   };
 }
 

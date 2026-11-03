@@ -565,3 +565,333 @@ export const v3PoolAbi = [
     ],
   },
 ] as const;
+
+/**
+ * BVCC Agent Wallet **V5** — the reads and the entrypoint whose shape differs from V4
+ * (generated from the frozen V5 build). V5 is detected from the wallet's EIP-712
+ * domain (`BVCCSmartWalletV5`); see `detectWalletVersion`.
+ */
+export const agentWalletV5Abi = [
+  {
+    "type": "function",
+    "name": "VALIDATOR_REGISTRY",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "address"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "executeAsAgent",
+    "inputs": [
+      {
+        "name": "mode",
+        "type": "bytes32"
+      },
+      {
+        "name": "executionData",
+        "type": "bytes"
+      }
+    ],
+    "outputs": [],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
+    "name": "getAgentCallPolicy",
+    "inputs": [
+      {
+        "name": "agent",
+        "type": "address"
+      },
+      {
+        "name": "target",
+        "type": "address"
+      },
+      {
+        "name": "selector",
+        "type": "bytes4"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint256"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "getAgentPermission",
+    "inputs": [
+      {
+        "name": "agent",
+        "type": "address"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "",
+        "type": "tuple",
+        "components": [
+          {
+            "name": "maxPerTxWei",
+            "type": "uint128"
+          },
+          {
+            "name": "dailyLimitWei",
+            "type": "uint128"
+          },
+          {
+            "name": "totalBudgetWei",
+            "type": "uint128"
+          },
+          {
+            "name": "periodBudgetWei",
+            "type": "uint128"
+          },
+          {
+            "name": "periodDuration",
+            "type": "uint64"
+          },
+          {
+            "name": "expiry",
+            "type": "uint64"
+          },
+          {
+            "name": "active",
+            "type": "bool"
+          },
+          {
+            "name": "paused",
+            "type": "bool"
+          },
+          {
+            "name": "allowedTokens",
+            "type": "address[]"
+          },
+          {
+            "name": "tokenMaxAmounts",
+            "type": "uint128[]"
+          },
+          {
+            "name": "tokenDailyLimits",
+            "type": "uint128[]"
+          },
+          {
+            "name": "tokenTotalBudgets",
+            "type": "uint128[]"
+          },
+          {
+            "name": "allowedProtocols",
+            "type": "address[]"
+          },
+          {
+            "name": "allowedRecipients",
+            "type": "address[]"
+          }
+        ]
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "getAgentSpending",
+    "inputs": [
+      {
+        "name": "agent",
+        "type": "address"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "",
+        "type": "tuple",
+        "components": [
+          {
+            "name": "totalSpentWei",
+            "type": "uint128"
+          },
+          {
+            "name": "periodSpentWei",
+            "type": "uint128"
+          },
+          {
+            "name": "periodStart",
+            "type": "uint64"
+          }
+        ]
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "getDailySpent",
+    "inputs": [
+      {
+        "name": "agent",
+        "type": "address"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint128"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "getTokenSpent",
+    "inputs": [
+      {
+        "name": "agent",
+        "type": "address"
+      },
+      {
+        "name": "token",
+        "type": "address"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "daily",
+        "type": "uint128"
+      },
+      {
+        "name": "total",
+        "type": "uint128"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "isTargetBlocked",
+    "inputs": [
+      {
+        "name": "target",
+        "type": "address"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "",
+        "type": "bool"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "paused",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "bool"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "walletType",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint8"
+      }
+    ],
+    "stateMutability": "pure"
+  }
+] as const;
+
+/** V5 validator registry: `validate` takes the agent and returns the validator's verdict. */
+export const validatorRegistryV5Abi = [
+  {
+    "type": "function",
+    "name": "validate",
+    "inputs": [
+      {
+        "name": "agent",
+        "type": "address"
+      },
+      {
+        "name": "wallet",
+        "type": "address"
+      },
+      {
+        "name": "target",
+        "type": "address"
+      },
+      {
+        "name": "value",
+        "type": "uint256"
+      },
+      {
+        "name": "data",
+        "type": "bytes"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "ok",
+        "type": "bool"
+      },
+      {
+        "name": "tokensToMeasure",
+        "type": "address[]"
+      },
+      {
+        "name": "costs",
+        "type": "tuple[]",
+        "components": [
+          {
+            "name": "token",
+            "type": "address"
+          },
+          {
+            "name": "amount",
+            "type": "uint256"
+          }
+        ]
+      },
+      {
+        "name": "wantsPostCheck",
+        "type": "bool"
+      },
+      {
+        "name": "chargeInflow",
+        "type": "bool"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "validators",
+    "inputs": [
+      {
+        "name": "target",
+        "type": "address"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "",
+        "type": "address"
+      }
+    ],
+    "stateMutability": "view"
+  }
+] as const;

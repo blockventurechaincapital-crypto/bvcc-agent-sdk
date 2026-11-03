@@ -1,10 +1,12 @@
 export { BvccAgentClient, BATCH_MODE, ZERO_ADDRESS } from "./client.js";
 export type { BvccAgentClientOptions } from "./client.js";
-export { NETWORKS, getNetwork } from "./networks.js";
+export { NETWORKS, getNetwork, V5_ADDRESSES } from "./networks.js";
 export type { BvccNetwork } from "./networks.js";
 export {
   agentWalletAbi,
+  agentWalletV5Abi,
   validatorRegistryAbi,
+  validatorRegistryV5Abi,
   erc20Abi,
   swapRouter02Abi,
   permit2AllowanceAbi,
@@ -25,6 +27,7 @@ export {
   decodePolicy,
   describePolicy,
   detectWalletVersion,
+  isV5,
   readCallPolicy,
   getPolicy,
   getActiveValidator,
@@ -32,6 +35,19 @@ export {
   diagnosePolicy,
 } from "./policy.js";
 export type { DecodedPolicy, WalletVersion, PolicyDiagnosis } from "./policy.js";
+export {
+  adaptBatchForV5,
+  remainingUnder,
+  withAgentFee,
+  v5Unlimited,
+  V5UnsupportedError,
+  UINT128_MAX,
+} from "./v5.js";
+export type { V5Context } from "./v5.js";
+export { refreshStaleDeadlines } from "./deadlines.js";
+export { encodeSourceTag, decodeSourceTag, SOURCE_TAG_MAGIC, DEFAULT_SOURCE } from "./sourceTag.js";
+export type { SourceTagOptions, SourceTool } from "./sourceTag.js";
+export { SDK_VERSION } from "./version.js";
 
 // Native ETH swaps (own batches via SwapRouter02 + WETH)
 export {

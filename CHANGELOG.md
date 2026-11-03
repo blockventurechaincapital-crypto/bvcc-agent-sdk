@@ -4,6 +4,84 @@ All notable changes to `@bvcc/agent-sdk` are documented here. This project follo
 [Semantic Versioning](https://semver.org/). While on `0.x`, the public API may
 change between minor versions.
 
+## [0.3.0] — 2026-11-03
+
+Support for **wallet V5**, the new generation of the BVCC Agent Wallet. V2–V4 wallets
+behave exactly as before; the client detects the generation of each wallet by itself.
+
+### Added
+- **V5 detection.** `detectWalletVersion` returns `"v5"`, read from the wallet's EIP-712
+  domain (V5 has no wallet-wide `getCallPolicy`, so the domain is asked first).
+  `client.walletVersion()` exposes it.
+- **V5 reads.** `getPermission` merges V5's `getAgentPermission` and `getAgentSpending`
+  into the usual shape and adds `paused` (this agent alone paused by the owner).
+  `getRemaining`, `canSpendNative` and `canSpendToken` apply the V5 meaning of limits —
+  `0` allows nothing, `type(uint128).max` is unlimited, an empty recipient list allows
+  no recipient — and count the agent fee inside the limits, as the contract does.
+- **V5 capabilities.** `getCapabilities` checks, per protocol, this agent's own call
+  policy, an active validator in the wallet's registry and that the owner has not
+  blocked the contract; it also reports missing Permit2 allowances to the Universal
+  Router. `getAgentStatus` reports `walletVersion` and counts the per-agent pause.
+- **Batch adaptation (`adaptBatchForV5`).** Right before a batch is sent or simulated
+  on a V5 wallet the client: drops the agent's own Permit2 grants (the owner grants
+  them on V5); sends SwapRouter02 swaps (`exactInputSingle`, `exactOutputSingle`,
+  `exactInput`, `exactOutput`) through the Universal Router; and refuses, with a clear
+  message, what V5 does not allow agents (native ETH swaps and wrapping, Uniswap v3
+  liquidity, Aave `repayWithATokens`). The builders are unchanged.
+- **Router deadlines on chain time (`refreshStaleDeadlines`).** Deadlines are set from
+  the computer's clock; when that clock is behind, the router reverted with
+  `TransactionDeadlinePassed`. Before sending, the client now renews any Universal
+  Router or v4 PositionManager deadline that the chain already sees as past. Applies to
+  every generation.
+- Readable errors for V5 (`AgentPaused`, `TargetIsBlocked`, `PostCheckFailed`,
+  `CallNeedsValidator`, `UnsupportedExecutionMode`, `TotalBudgetExceeded`, …), for
+  Permit2 (`AllowanceExpired`, `InsufficientAllowance`) and for the Uniswap routers
+  (`TransactionDeadlinePassed`, `V3TooLittleReceived`, `V3InvalidSwap`, …).
+- `agentWalletV5Abi`, `validatorRegistryV5Abi`, `V5_ADDRESSES`, and the Arbitrum Sepolia
+  Aave market and test USDC.
+- Guides: V5 notes for getting started, swaps, lending and liquidity.
+
+### Fixed
+- **Out of gas on valid transactions.** `execute()` sent with exactly the gas estimate, so
+  a batch could run out when the state moved a little before it was mined (seen on LP
+  mints and decrease + collect + burn). It now estimates and sends with a 20% margin
+  (`gasBufferBps` in the client options). A batch that would revert is still never sent;
+  unused gas is not paid.
+
+### Added (from the analysis of a live wallet)
+- **`retryable` on every failure** (`DecodedRevert`, `ActionFailure`): `false` means the
+  same call will fail again — budgets, permissions, missing balance, no debt to repay.
+  Uniswap's `STF` is explained as a missing balance, and Aave's numeric codes (`39`,
+  `35`, …) and named errors (`NoDebtOfSelectedType`, …) are decoded.
+- **Liquidity ranges as prices.** `addLiquidityV3/V4` and their plans and dry runs take
+  `priceLower` / `priceUpper` (tokenA per tokenB), converted to ticks with both tokens'
+  decimals. Every non-full range is read against the pool's current price and returned
+  as `range` with warnings; a range that does not contain the current price is not opened on
+  the first call — the failure asks to confirm with the user — and is opened when called
+  again with `allowOutOfRange: true`.
+- **Source tag.** Eight bytes at the end of each `executeAsAgent` call: `"bvcc"`, the tool
+  (SDK or MCP) and its version. The wallet ignores them (checked on V4 and V5 wallets,
+  about 100 gas); they say nothing about the user, wallet or agent. `sourceTag: false`
+  turns them off; `decodeSourceTag` reads them back. `SDK_VERSION` comes from
+  package.json at build time.
+- **Room for the V5 fee.** `maxSpendable(token)` returns the most that can leave the
+  wallet with the agent fee on top; `sendNative` / `sendToken` and their dry runs refuse
+  a whole-balance move on V5 with that figure, before any gas.
+
+- **Uniswap v3 liquidity and native-coin swaps on V5, where their validators are active.**
+  The client checks the wallet's registry before sending: with an active validator for the
+  v3 NonfungiblePositionManager or the wrapped native token, those calls go through; without
+  one they come back as "not active yet on this network", before any gas.
+  `getCapabilities` reports `canProvideLiquidityV3` and `canWrapNative`. On V5,
+  `swapToNative` / `swapFromNative` size the swap to the exact amount (the fee is charged on
+  top there), so no wrapped dust is left behind.
+- Stale deadlines are also renewed on Uniswap v3 mint / decrease calls.
+
+### Changed
+- On V5, Aave plans name the Universal Router as the swap protocol they need, and
+  `planClosePosition` explains how to close a same-asset position instead of planning
+  `repayWithATokens`.
+
 ## [0.2.2] — 2026-07-30
 
 Maintenance release. **No API change and no behaviour change** — `src/` is byte-identical

@@ -57,6 +57,14 @@ export const AAVE: Record<number, AaveAddresses> = {
     poolDataProvider: "0x243Aa95cAC2a25651eda86e80bEe66114413c43b",
     oracle: "0xb023e699F5a33916Ea823A16485e259257cA8Bd1",
   },
+  // Arbitrum Sepolia (testnet) — Aave v3 market, resolved on-chain from the Pool's
+  // ADDRESSES_PROVIDER (2 Nov 2026).
+  421614: {
+    pool: "0xBfC91D59fdAA134A4ED45f7B584cAf96D7792Eff",
+    poolAddressesProvider: "0xB25a5D144626a0D488e52AE717A051a2E9997076",
+    poolDataProvider: "0x12373B5085e3b42D42C1D4ABF3B3Cf4Df0E0Fa01",
+    oracle: "0xEf95A6B9e88Bd509Fd67BA741cf2b263DaC65c00",
+  },
 };
 
 /** Aave addresses for a chain, or undefined if the SDK has no Aave support there. */

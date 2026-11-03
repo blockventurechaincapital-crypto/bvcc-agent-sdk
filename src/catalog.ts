@@ -23,6 +23,7 @@
  * decimals and converts to base units. Tokens accept a symbol ("USDC") or a 0x
  * address.
  */
+import { UINT128_MAX } from "./v5.js";
 import { formatUnits, isAddress, parseEther, parseUnits, type Address } from "viem";
 import { z } from "zod";
 import { erc20Abi } from "./abi.js";
@@ -253,13 +254,22 @@ async function tokenMeta(
 // Human-readable formatting for reads that return raw base-unit amounts.
 // Small LLMs reliably misconvert wei → decimal; surfacing a `formatted` string
 // next to the raw value removes that failure mode. Semantics matter:
-//   - cap/limit/budget fields: 0 (or null) means UNLIMITED.
+//   - cap/limit/budget fields: 0 (or null) means UNLIMITED before V5; on V5, 0 means
+//     NOT ALLOWED and only null / type(uint128).max is unlimited.
 //   - remaining fields: null means UNLIMITED, 0 means EXHAUSTED ("0").
 //   - spent fields: always a literal amount.
 // ---------------------------------------------------------------------------
 
-/** A cap/limit/budget: 0 or null renders as "unlimited". */
-function fmtCap(raw: bigint | null, decimals: number, symbol: string): string {
+/**
+ * A cap/limit/budget. Before V5, 0 or null renders as "unlimited". On wallet V5,
+ * 0 means nothing is allowed and only null / type(uint128).max is unlimited.
+ */
+function fmtCap(raw: bigint | null, decimals: number, symbol: string, v5 = false): string {
+  if (v5) {
+    if (raw == null || raw === UINT128_MAX) return "unlimited";
+    if (raw === 0n) return `not allowed (0 ${symbol})`;
+    return `${formatUnits(raw, decimals)} ${symbol}`;
+  }
   if (raw == null || raw === 0n) return "unlimited";
   return `${formatUnits(raw, decimals)} ${symbol}`;
 }
@@ -357,6 +367,7 @@ const approve: Capability<{ token: string; spender: string; amount: string }> = 
   title: "Approve a spender",
   summary: "Grant an ERC-20 allowance to a spender (counts toward the token budget).",
   description:
+    "Wallet V5: the spender must be one of the agent's allowed protocols, and the allowance is reset to zero when the batch ends. " +
     "Approves `spender` to move up to `amount` of `token`. The approved amount counts toward the " +
     "agent's on-chain token budget (anti cap-bypass). Prefer exact amounts over unlimited approvals.",
   params: z.object({ token: zToken, spender: zAddress, amount: zAmount }),
@@ -402,6 +413,7 @@ const swapV3: Capability<SwapArgs> = {
   title: "Swap on Uniswap v3 (SwapRouter02)",
   summary: "Exact-input swap of one ERC-20 for another via Uniswap v3.",
   description:
+    "Wallet V5: SwapRouter02 is not available to agents there; the client sends this same swap through the Universal Router automatically, pulling through the owner's Permit2 allowance. " +
     "Atomic approve + exactInputSingle on the network's SwapRouter02. Output is returned to the " +
     "wallet. Requires the router in allowedProtocols and `tokenIn` in allowedTokens. ERC-20 in/out only. " +
     "Pass `amountOutMinimum` (exact) or `slippageBps` (e.g. 50 = 0.5%, 100 = 1%); one is required.",
@@ -444,6 +456,7 @@ const swapV4: Capability<SwapV4Args> = {
   title: "Swap on Uniswap v4 (Universal Router + Permit2)",
   summary: "Exact-input swap via Uniswap v4 pools through the Universal Router.",
   description:
+    "Wallet V5: Permit2 is granted by the owner, so the agent only needs the Universal Router allowed; v4 pools with a hook work only if the hook is approved. " +
     "Permit2-funded v4 swap through the Universal Router — byte-compatible with app.uniswap.org. " +
     "Reaches liquidity living on v4 pools (identified by fee + tickSpacing). Requires BOTH the " +
     "Universal Router and Permit2 in allowedProtocols, and `tokenIn` in allowedTokens. " +
@@ -556,10 +569,12 @@ const getRemaining: Capability<Record<string, never>> = {
   summary: "Live remaining headroom across every spend limit (null = unlimited).",
   description:
     "Computes remaining native/period/per-token headroom from live on-chain spend. A null field " +
-    "means that limit is unlimited/disabled on-chain.",
+    "means that limit is unlimited. On wallet V5 a 0 limit means not allowed (shown as such), and " +
+    "limits are checked on the amount plus a small on-chain charge, so stay a little under them.",
   params: z.object({}),
   invoke: async (client) => {
     const r = await client.getRemaining();
+    const v5 = (await client.walletVersion()) === "v5";
     const cur = client.network.currency;
     const tokens = await Promise.all(
       r.tokens.map(async (t) => {
@@ -569,9 +584,9 @@ const getRemaining: Capability<Record<string, never>> = {
           symbol,
           decimals,
           formatted: {
-            maxPerTx: fmtCap(t.maxPerTx, decimals, symbol),
-            dailyLimit: fmtCap(t.dailyLimit, decimals, symbol),
-            totalBudget: fmtCap(t.totalBudget, decimals, symbol),
+            maxPerTx: fmtCap(t.maxPerTx, decimals, symbol, v5),
+            dailyLimit: fmtCap(t.dailyLimit, decimals, symbol, v5),
+            totalBudget: fmtCap(t.totalBudget, decimals, symbol, v5),
             dailySpent: fmtAmount(t.dailySpent, decimals, symbol),
             totalSpent: fmtAmount(t.totalSpent, decimals, symbol),
             dailyRemaining: fmtRemaining(t.dailyRemaining, decimals, symbol),
@@ -584,7 +599,7 @@ const getRemaining: Capability<Record<string, never>> = {
       ...r,
       currency: cur,
       formatted: {
-        maxPerTx: fmtCap(r.maxPerTxWei, 18, cur),
+        maxPerTx: fmtCap(r.maxPerTxWei, 18, cur, v5),
         dailyRemaining: fmtRemaining(r.dailyRemainingWei, 18, cur),
         totalRemaining: fmtRemaining(r.totalRemainingWei, 18, cur),
         periodRemaining: fmtRemaining(r.periodRemainingWei, 18, cur),
@@ -606,6 +621,7 @@ const needsApproval: Capability<{
   title: "Check if approval is needed",
   summary: "Whether `spender` still needs an approval to move `amount` of `token`.",
   description:
+    "Wallet V5: Permit2 allowances are the owner's \u2014 if one is missing, ask the owner to renew the agent rather than approving. " +
     "Reads current allowances and returns true if an approve is required before `spender` can move " +
     "`amount`. For Universal Router / v4 swaps pass `viaPermit2: true` (checks ERC-20→Permit2 and " +
     "Permit2→router).",
@@ -772,6 +788,7 @@ const swapToNative: Capability<{
   title: "Swap a token for native ETH",
   summary: "Sell a token and receive native ETH in the wallet (one 0.15% fee).",
   description:
+    "Wallet V5: works where the wrapped-native validator is active and the owner allowed it for this agent (getCapabilities \u2192 canWrapNative); otherwise swap to WETH. " +
     "Atomic batch: approve → exact-output swap to WETH (recipient = wallet) → unwrap to ETH. " +
     "Exact-output means you get precisely `amountOut` ETH with no leftover WETH dust, and only " +
     "ONE 0.15% fee is charged. " +
@@ -811,6 +828,7 @@ const swapFromNative: Capability<{
   title: "Swap native ETH for a token",
   summary: "Spend native ETH to buy a token. The 0.15% agent fee applies.",
   description:
+    "Wallet V5: works where the wrapped-native validator is active and the owner allowed it for this agent (getCapabilities \u2192 canWrapNative); otherwise swap from WETH. " +
     "Atomic batch: wrap ETH to WETH → approve → swap to `tokenOut` (recipient = wallet). " +
     "The 0.15% agent fee applies. The swap is sized to the post-fee WETH automatically. " +
     "Requires WETH in allowedProtocols and allowedTokens. " +
@@ -958,6 +976,7 @@ const aaveRepayWithATokens: Capability<{ asset: string; amount: string }> = {
   title: "Repay Aave debt with aTokens",
   summary: "Repay debt directly from supplied collateral, no underlying needed.",
   description:
+    "Not available on wallet V5: withdraw the asset and repay with it instead. " +
     'Repays variable-rate debt using the wallet\'s own aTokens — no approve, no underlying transfer. ' +
     'Pass `"max"` for the full debt. Useful for deleveraging in one step.',
   params: z.object({ asset: zToken, amount: zAaveAmountOrMax }),
@@ -1210,6 +1229,9 @@ const addLiquidityV3: Capability<{
   fee: number;
   tickLower?: number;
   tickUpper?: number;
+  priceLower?: string;
+  priceUpper?: string;
+  allowOutOfRange?: boolean;
   slippageBps?: number;
 }> = {
   id: "addLiquidityV3",
@@ -1218,11 +1240,12 @@ const addLiquidityV3: Capability<{
   title: "Open a Uniswap v3 liquidity position",
   summary: "Provide two ERC-20 tokens as liquidity; the position NFT is owned by the wallet.",
   description:
+    "Wallet V5: works where the Uniswap v3 position validator is active and the owner allowed it for this agent (getCapabilities \u2192 canProvideLiquidityV3); otherwise use addLiquidityV4. " +
     "Atomic approve(s) + mint on the Uniswap v3 NonfungiblePositionManager. The position NFT is minted " +
     "to the wallet (pinned by policy). `amountA`/`amountB` are the MAXIMUM you'll deposit of each token; " +
     "the SDK reads the pool's current price and sizes the two amounts to the pool ratio (so one side is " +
     "usually only partly used), with minimums slippageBps below the sized amounts (50 = 0.5%). Defaults to " +
-    "FULL-RANGE; pass tickLower/tickUpper (aligned to the pool's spacing) for a concentrated range. Requires " +
+    "FULL-RANGE; for a concentrated range pass priceLower/priceUpper (tokenA per tokenB) — preferred — or raw tickLower/tickUpper. A range that does not contain the current price is not opened on the first call: ask the user to confirm, then call again with allowOutOfRange: true and it is opened; the result reports the range read against the current price. Requires " +
     "the NFPM in allowedProtocols and both tokens in allowedTokens (the approves count toward the token " +
     "budget). ERC-20/ERC-20 only — native ETH LP is v4.",
   params: z.object({
@@ -1233,6 +1256,14 @@ const addLiquidityV3: Capability<{
     fee: lpFeeParam,
     tickLower: z.number().int().optional().describe("Lower tick for a concentrated range (advanced). Omit for full-range."),
     tickUpper: z.number().int().optional().describe("Upper tick for a concentrated range (advanced). Omit for full-range."),
+    priceLower: zAmount
+      .optional()
+      .describe("Range as prices (preferred over ticks): the lower price, in tokenA per tokenB — e.g. 2000 for USDC per WETH. Give both bounds."),
+    priceUpper: zAmount.optional().describe("Upper price of the range, in tokenA per tokenB."),
+    allowOutOfRange: z
+      .boolean()
+      .optional()
+      .describe("Set to true after the user confirms opening a position outside the current price (a single-token, limit-style position)."),
     slippageBps: z.number().int().optional().describe("Slippage for the amount minimums, in bps. Default 50 (0.5%)."),
   }),
   invoke: async (client, p) => {
@@ -1246,6 +1277,9 @@ const addLiquidityV3: Capability<{
       fee: p.fee,
       tickLower: p.tickLower,
       tickUpper: p.tickUpper,
+      priceLower: p.priceLower,
+      priceUpper: p.priceUpper,
+      allowOutOfRange: p.allowOutOfRange,
       slippageBps: p.slippageBps,
     });
   },
@@ -1258,6 +1292,7 @@ const removeLiquidityV3: Capability<{ tokenId: string; bps?: number; burn?: bool
   title: "Remove Uniswap v3 liquidity",
   summary: "Withdraw part or all of a position's liquidity (plus fees) to the wallet.",
   description:
+    "Wallet V5: needs the Uniswap v3 position validator active on this network (getCapabilities \u2192 canProvideLiquidityV3). " +
     "decreaseLiquidity + collect in one batch, both to the wallet. `bps` is the fraction of the " +
     "position's current liquidity to remove (10000 = all, the default). With `burn: true` a full " +
     "removal also burns the emptied NFT. Only works on positions the wallet owns (the NFPM enforces it).",
@@ -1276,6 +1311,7 @@ const collectFeesV3: Capability<{ tokenId: string }> = {
   title: "Collect Uniswap v3 fees",
   summary: "Collect a position's owed fees to the wallet.",
   description:
+    "Wallet V5: needs the Uniswap v3 position validator active on this network (getCapabilities \u2192 canProvideLiquidityV3). " +
     "Calls collect(recipient = wallet) on the NFPM, sweeping all owed fees to the wallet. Only the " +
     "position owner can collect (enforced by the NFPM). No BVCC fee is charged (v3 collect calldata " +
     "carries no token address for the fee snapshot to see).",
@@ -1290,6 +1326,7 @@ const burnV3: Capability<{ tokenId: string }> = {
   title: "Burn an empty Uniswap v3 position",
   summary: "Burn a position NFT once its liquidity and fees are zero.",
   description:
+    "Wallet V5: needs the Uniswap v3 position validator active on this network (getCapabilities \u2192 canProvideLiquidityV3). " +
     "Burns the position NFT. The NFPM requires the position to be fully removed (liquidity and owed " +
     "fees both 0) first — use removeLiquidityV3 with burn:true to do both in one call.",
   params: z.object({ tokenId: zTokenId }),
@@ -1331,6 +1368,9 @@ const dryRunAddLiquidityV3: Capability<{
   fee: number;
   tickLower?: number;
   tickUpper?: number;
+  priceLower?: string;
+  priceUpper?: string;
+  allowOutOfRange?: boolean;
   slippageBps?: number;
 }> = {
   id: "dryRunAddLiquidityV3",
@@ -1338,7 +1378,7 @@ const dryRunAddLiquidityV3: Capability<{
   module: "lp",
   title: "Dry-run open v3 position",
   summary: "Simulate opening a v3 position (gas + revert reason) without sending.",
-  description: "Same inputs as addLiquidityV3, but only simulates.",
+  description: "Wallet V5: needs the Uniswap v3 position validator active on this network. " + "Same inputs as addLiquidityV3, but only simulates.",
   params: addLiquidityV3.params,
   invoke: async (client, p) => {
     const a = await toBaseUnits(client, p.tokenA, p.amountA);
@@ -1353,6 +1393,9 @@ const dryRunAddLiquidityV3: Capability<{
         fee: p.fee,
         tickLower: p.tickLower,
         tickUpper: p.tickUpper,
+      priceLower: p.priceLower,
+      priceUpper: p.priceUpper,
+      allowOutOfRange: p.allowOutOfRange,
         slippageBps: p.slippageBps,
       }),
     );
@@ -1365,7 +1408,7 @@ const dryRunRemoveLiquidityV3: Capability<{ tokenId: string; bps?: number; burn?
   module: "lp",
   title: "Dry-run remove v3 liquidity",
   summary: "Simulate removing v3 liquidity (gas + revert reason) without sending.",
-  description: "Same inputs as removeLiquidityV3, but only simulates.",
+  description: "Wallet V5: needs the Uniswap v3 position validator active on this network. " + "Same inputs as removeLiquidityV3, but only simulates.",
   params: removeLiquidityV3.params,
   invoke: async (client, p) =>
     enrichDryRun(client, await client.dryRunRemoveLiquidityV3({ tokenId: BigInt(p.tokenId), bps: p.bps, burn: p.burn })),
@@ -1408,6 +1451,9 @@ const addLiquidityV4: Capability<{
   hooks?: string;
   tickLower?: number;
   tickUpper?: number;
+  priceLower?: string;
+  priceUpper?: string;
+  allowOutOfRange?: boolean;
   slippageBps?: number;
 }> = {
   id: "addLiquidityV4",
@@ -1416,9 +1462,10 @@ const addLiquidityV4: Capability<{
   title: "Open a Uniswap v4 liquidity position",
   summary: "Provide liquidity on Uniswap v4 — supports NATIVE ETH (use \"ETH\" as a token).",
   description:
+    "Wallet V5: Permit2 is granted by the owner (the client leaves those steps out); one call may not both remove liquidity and add it elsewhere. " +
     "Mint a v4 position via the PositionManager. Use \"ETH\" for a native side (no wrapping — v4 pools " +
     "are native-first). `amountA`/`amountB` are the MAXIMUMS; the SDK reads the pool price and sizes the " +
-    "amounts to the ratio. Defaults to full-range; pass tickLower/tickUpper for a concentrated range. " +
+    "amounts to the ratio. Defaults to full-range; for a concentrated range pass priceLower/priceUpper (tokenA per tokenB) — preferred — or raw tickLower/tickUpper. A range that does not contain the current price is not opened on the first call: ask the user to confirm, then call again with allowOutOfRange: true and it is opened. " +
     "`hooks` defaults to none — a hooked pool only works if that hook is approved in the BVCC hook registry. " +
     "The position and all proceeds are pinned to the wallet." + v4Warn,
   params: z.object({
@@ -1431,6 +1478,14 @@ const addLiquidityV4: Capability<{
     hooks: zAddress.optional().describe("Pool hook contract. Omit for a no-hook pool (must be approved otherwise)."),
     tickLower: z.number().int().optional(),
     tickUpper: z.number().int().optional(),
+    priceLower: zAmount
+      .optional()
+      .describe("Range as prices (preferred over ticks): the lower price, in tokenA per tokenB — e.g. 2000 for USDC per WETH. Give both bounds."),
+    priceUpper: zAmount.optional().describe("Upper price of the range, in tokenA per tokenB."),
+    allowOutOfRange: z
+      .boolean()
+      .optional()
+      .describe("Set to true after the user confirms opening a position outside the current price (a single-token, limit-style position)."),
     slippageBps: z.number().int().optional().describe("Slippage for the amount minimums, in bps. Default 50."),
   }),
   invoke: async (client, p) => {
@@ -1446,6 +1501,9 @@ const addLiquidityV4: Capability<{
       hooks: p.hooks as Address | undefined,
       tickLower: p.tickLower,
       tickUpper: p.tickUpper,
+      priceLower: p.priceLower,
+      priceUpper: p.priceUpper,
+      allowOutOfRange: p.allowOutOfRange,
       slippageBps: p.slippageBps,
     });
   },
@@ -1515,6 +1573,9 @@ const dryRunAddLiquidityV4: Capability<{
   hooks?: string;
   tickLower?: number;
   tickUpper?: number;
+  priceLower?: string;
+  priceUpper?: string;
+  allowOutOfRange?: boolean;
   slippageBps?: number;
 }> = {
   id: "dryRunAddLiquidityV4",
@@ -1539,6 +1600,9 @@ const dryRunAddLiquidityV4: Capability<{
         hooks: p.hooks as Address | undefined,
         tickLower: p.tickLower,
         tickUpper: p.tickUpper,
+      priceLower: p.priceLower,
+      priceUpper: p.priceUpper,
+      allowOutOfRange: p.allowOutOfRange,
         slippageBps: p.slippageBps,
       }),
     );

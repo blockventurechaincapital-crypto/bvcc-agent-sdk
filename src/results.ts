@@ -49,6 +49,8 @@ export interface ActionFailure extends ActionContext {
   suggestedAction: string;
   /** Selector or short message — never contains secrets. */
   rawError: string;
+  /** false: the same call will fail again — do not repeat it with the same parameters. */
+  retryable: boolean;
 }
 
 export type ActionResult = ActionSuccess | ActionFailure;
@@ -65,6 +67,7 @@ export function fail(action: ActionName, decoded: DecodedRevert, ctx: ActionCont
     humanMessage: decoded.humanMessage,
     suggestedAction: decoded.suggestedAction,
     rawError: decoded.rawError,
+    retryable: decoded.retryable,
     ...ctx,
   };
 }

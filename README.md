@@ -315,6 +315,45 @@ Runnable scripts for all of the above live in [`examples/`](https://github.com/b
 
 ---
 
+## Wallet V5
+
+The SDK works with every wallet generation and finds out which one it is talking to
+by itself (`await agent.walletVersion()`). On a **V5** wallet a few things change:
+
+- **Limits:** `0` allows nothing (before V5 it meant unlimited) and an empty recipient
+  list allows no recipient. Limits count the agent fee too, so stay a little under them.
+  `getRemaining` and the `canSpend*` checks already apply these rules.
+- **Swaps** run through the Universal Router, between ERC-20 tokens. `swapExactInputV3`
+  keeps working: on V5 the client sends it through the Universal Router for you.
+  Native-coin swaps (wrapping) and **Uniswap v3 liquidity** work where their validators are
+  active on that network — `getCapabilities` says so (`canWrapNative`,
+  `canProvideLiquidityV3`); elsewhere use WETH and v4 liquidity.
+- **Permit2** allowances for swaps and v4 liquidity are granted by the wallet owner when
+  authorizing or renewing the agent. The client leaves them out of the agent's batch.
+- **Liquidity:** Uniswap v4, and v3 where its validator is active. **Aave:** everything except `repayWithATokens`, and the
+  health factor must stay at or above 1.2 after each batch.
+- The owner can **pause** one agent, **block** a contract for every agent and **renew**
+  the expiry. `getAgentStatus` and `getCapabilities` report all of it, with notes.
+
+Anything V5 does not allow comes back as a failed result with a plain explanation
+(`errorName: "V5Unsupported"`), before any gas is spent.
+
+## Good to know
+
+- **Retry or not.** Every failed result carries `retryable`. When it is `false` the same
+  call will fail again (a budget is used up, a permission is missing, the balance is
+  short): change the input or ask the owner instead of repeating it.
+- **Liquidity ranges as prices.** Pass `priceLower` / `priceUpper` — how many `tokenA` one
+  `tokenB` is worth — rather than raw ticks. A range that does not contain the current
+  price needs a confirmation: the first call stops and asks, and `allowOutOfRange: true` opens it; the result shows the range
+  read against the current price.
+- **Gas margin.** Transactions are sent with 20% more gas than the estimate
+  (`gasBufferBps`); unused gas is not paid.
+- **Source tag.** Each transaction ends with 8 bytes naming the tool that built it (this
+  SDK or the BVCC MCP) and its version, so BVCC can tell which releases are in use and
+  tie failures to a version. It carries nothing about you, your wallet or your agent,
+  and the wallet ignores it. Turn it off with `new BvccAgentClient({ ..., sourceTag: false })`.
+
 ## For developers
 
 The rest is reference detail. The plain-language part above is enough to use the SDK.
@@ -390,7 +429,8 @@ leg (the agent's UR validator forbids parking output in the router). `path`
 enables multi-hop.
 
 The UR and v4 paths use **Permit2 funding**: `approve(token → Permit2)` +
-`Permit2.approve(token → router)` + `execute(... payerIsUser=true)`. Nothing is
+`Permit2.approve(token → router)` + `execute(... payerIsUser=true)` (on V5 the owner
+grants both allowances and the client leaves them out of the batch). Nothing is
 transferred blindly, so a wrong router address reverts instead of losing funds.
 Permit2's address is hardcoded (same on every chain); the Universal Router is
 preconfigured on the supported chains — pass `router` for a custom endpoint. The

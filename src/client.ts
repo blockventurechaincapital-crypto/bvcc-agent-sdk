@@ -1,4 +1,5 @@
 import {
+  concat,
   createPublicClient,
   createWalletClient,
   encodeAbiParameters,
@@ -18,6 +19,7 @@ import { privateKeyToAccount } from "viem/accounts";
 
 import {
   agentWalletAbi,
+  agentWalletV5Abi,
   erc20Abi,
   nfpmAbi,
   permit2AllowanceAbi,
@@ -27,8 +29,13 @@ import {
   v4StateViewAbi,
   v4PositionManagerReadAbi,
 } from "./abi.js";
-import { detectWalletVersion, getActiveValidator, getPolicy, SELECTORS } from "./policy.js";
+import { detectWalletVersion, getActiveValidator, getPolicy, SELECTORS, type WalletVersion } from "./policy.js";
+import { adaptBatchForV5, remainingUnder, v5Unlimited, withAgentFee } from "./v5.js";
+import { refreshStaleDeadlines } from "./deadlines.js";
+import { describeRange, pricesToTicks, tickFromSqrtPrice, type RangeInfo } from "./lp/range.js";
+import { DEFAULT_SOURCE, encodeSourceTag, type SourceTagOptions } from "./sourceTag.js";
 import { AaveClient } from "./aave/client.js";
+import { getAaveAddresses } from "./aave/addresses.js";
 import { buildNativeToToken, buildTokenToNative } from "./nativeSwap.js";
 import { getNetwork, type BvccNetwork } from "./networks.js";
 import {
@@ -116,12 +123,69 @@ export interface BvccAgentClientOptions {
   rpcUrl?: string;
   /** Provide a custom viem transport instead of `http(rpcUrl)`. */
   transport?: Transport;
+  /**
+   * Eight bytes appended to each `executeAsAgent` call naming the tool and version
+   * that built it (see `sourceTag.ts`). Defaults to this SDK and its version. The
+   * wallet ignores them; pass `false` to leave them out.
+   */
+  sourceTag?: SourceTagOptions | false;
+  /**
+   * Extra gas on top of the estimate, in basis points (2000 = +20%, the default).
+   * Sending with exactly the estimate fails when the state moves a little before the
+   * transaction is mined (accrued LP fees, Arbitrum's L1 cost). Unused gas is not paid.
+   */
+  gasBufferBps?: number;
+}
+
+const DEFAULT_GAS_BUFFER_BPS = 2_000;
+
+/** Range options shared by the v3 and v4 liquidity planners. */
+export interface LiquidityRangeParams {
+  /**
+   * The range as prices: how many `tokenA` one `tokenB` is worth (e.g. tokenA USDC,
+   * tokenB WETH → 2000 and 3000). Converted to ticks with both tokens' decimals —
+   * prefer this over raw ticks.
+   */
+  priceLower?: number | string;
+  priceUpper?: number | string;
+  /** Open the position even if the range does not contain the current price. */
+  allowOutOfRange?: boolean;
+}
+
+/** A planned range that does not contain the current price. */
+export class OutOfRangeError extends Error {
+  readonly bvccDecoded: DecodedRevert;
+  constructor(readonly range: RangeInfo) {
+    super(range.warnings[0] ?? "The range does not contain the current price.");
+    this.name = "OutOfRangeError";
+    this.bvccDecoded = {
+      errorName: "RangeOutOfPrice",
+      humanMessage: `Needs confirmation: ${this.message}`,
+      suggestedAction:
+        `Ask the user whether to open this position outside the current price (${range.priceCurrent}). ` +
+        `If they confirm, call again with the same parameters plus allowOutOfRange: true — it will be opened. ` +
+        `If not, use a range that contains the current price.`,
+      rawError: `range ${range.priceLower}-${range.priceUpper}, current ${range.priceCurrent}`,
+      retryable: false,
+    };
+  }
+}
+
+/** A planner error as a decoded failure (planning throws plain errors too). */
+function planningFailure(e: unknown): DecodedRevert {
+  if (e && typeof e === "object" && "bvccDecoded" in e) return (e as { bvccDecoded: DecodedRevert }).bvccDecoded;
+  const msg = e instanceof Error ? e.message : String(e);
+  return {
+    errorName: "PlanningFailed",
+    humanMessage: msg,
+    suggestedAction: "Fix the inputs named in the message, then try again.",
+    rawError: msg.slice(0, 160),
+    retryable: false,
+  };
 }
 
 const ZERO: Address = "0x0000000000000000000000000000000000000000";
 
-const subOrNull = (limit: bigint, spent: bigint): bigint | null =>
-  limit === 0n ? null : limit > spent ? limit - spent : 0n;
 
 /**
  * Client for operating a BVCC Agent Wallet from an off-chain AI agent.
@@ -137,6 +201,8 @@ export class BvccAgentClient {
   readonly walletAddress: Address;
   readonly publicClient: PublicClient;
   readonly walletClient: WalletClient;
+  private readonly sourceTagHex: Hex | null;
+  private readonly gasBufferBps: number;
 
   constructor(opts: BvccAgentClientOptions) {
     this.network =
@@ -146,6 +212,8 @@ export class BvccAgentClient {
         ? privateKeyToAccount(opts.account)
         : opts.account;
     this.walletAddress = opts.walletAddress;
+    this.sourceTagHex = opts.sourceTag === false ? null : encodeSourceTag(opts.sourceTag ?? DEFAULT_SOURCE);
+    this.gasBufferBps = opts.gasBufferBps ?? DEFAULT_GAS_BUFFER_BPS;
 
     const transport = opts.transport ?? http(opts.rpcUrl ?? this.network.rpcUrl);
     const chain = {
@@ -162,6 +230,76 @@ export class BvccAgentClient {
   /** The agent EOA address (derived from the signer). */
   get agentAddress(): Address {
     return this.account.address;
+  }
+
+  /** The wallet's generation (`"v2"` … `"v5"`), read once from the chain and cached. */
+  walletVersion(): Promise<WalletVersion> {
+    return detectWalletVersion(this.publicClient, this.walletAddress);
+  }
+
+  /**
+   * The batch as this wallet will accept it. On V5 the agent's own Permit2 grants
+   * are dropped (the owner grants them), SwapRouter02 swaps go through the
+   * Universal Router, and what V5 does not allow is refused with a clear reason.
+   * Earlier generations get the batch unchanged.
+   */
+  async prepareBatch(executions: Execution[]): Promise<Execution[]> {
+    const chainNow = await this.chainTime();
+    let batch = executions;
+    if ((await this.walletVersion()) === "v5") {
+      const [v3LiquidityActive, wrapActive] = await Promise.all([
+        this.v5ValidatorActive(this.network.nfpm),
+        this.v5ValidatorActive(this.network.weth),
+      ]);
+      batch = adaptBatchForV5(batch, {
+        wallet: this.walletAddress,
+        v3LiquidityActive,
+        wrapActive,
+        universalRouter: this.network.universalRouter,
+        swapRouter02: this.network.swapRouter02,
+        nfpm: this.network.nfpm,
+        weth: this.network.weth,
+        now: chainNow ?? undefined,
+      });
+    }
+    // Deadlines come from the computer's clock; renew any the chain already sees as past.
+    if (chainNow !== null) {
+      batch = refreshStaleDeadlines(batch, chainNow, {
+        universalRouter: this.network.universalRouter,
+        positionManagerV4: this.network.positionManagerV4,
+        nfpm: this.network.nfpm,
+      });
+    }
+    return batch;
+  }
+
+  /** The wallet's (V5) validator registry, read once. */
+  private v5Registry?: Promise<Address>;
+  private v5RegistryAddress(): Promise<Address> {
+    return (this.v5Registry ??= this.publicClient.readContract({
+      address: this.walletAddress,
+      abi: agentWalletV5Abi,
+      functionName: "VALIDATOR_REGISTRY",
+    }) as Promise<Address>);
+  }
+
+  /** Whether the wallet's V5 registry has an active validator for `target`. */
+  private async v5ValidatorActive(target?: Address): Promise<boolean> {
+    if (!target) return false;
+    try {
+      return (await getActiveValidator(this.publicClient, await this.v5RegistryAddress(), target)) !== null;
+    } catch {
+      return false;
+    }
+  }
+
+  /** The latest block's timestamp, or null if the node cannot be reached. */
+  private async chainTime(): Promise<bigint | null> {
+    try {
+      return (await this.publicClient.getBlock({ blockTag: "latest" })).timestamp;
+    } catch {
+      return null;
+    }
   }
 
   // ------------------------------------------------------------------
@@ -328,14 +466,17 @@ export class BvccAgentClient {
     amountInMaximum: bigint;
     fee?: number;
     router?: Address;
+    /** Wallet V5 fee model (set for you by `swapToNative`). */
+    feeOnTop?: boolean;
   }): Execution[] {
     const { router, weth } = this.nativeSwapDeps(params.router);
     return buildTokenToNative({ ...params, router, weth, wallet: this.walletAddress });
   }
 
   /** Submit a token → ETH swap. Structured result. */
-  swapToNative(params: Parameters<BvccAgentClient["buildSwapToNative"]>[0]): Promise<ActionResult> {
-    return this.run("swapToNative", this.buildSwapToNative(params));
+  async swapToNative(params: Parameters<BvccAgentClient["buildSwapToNative"]>[0]): Promise<ActionResult> {
+    const feeOnTop = params.feeOnTop ?? (await this.walletVersion()) === "v5";
+    return this.run("swapToNative", this.buildSwapToNative({ ...params, feeOnTop }));
   }
 
   /**
@@ -350,14 +491,17 @@ export class BvccAgentClient {
     amountOutMinimum: bigint;
     fee?: number;
     router?: Address;
+    /** Wallet V5 fee model (set for you by `swapFromNative`). */
+    feeOnTop?: boolean;
   }): Execution[] {
     const { router, weth } = this.nativeSwapDeps(params.router);
     return buildNativeToToken({ ...params, router, weth, wallet: this.walletAddress });
   }
 
   /** Submit an ETH → token swap (0.15% agent fee). Structured result. */
-  swapFromNative(params: Parameters<BvccAgentClient["buildSwapFromNative"]>[0]): Promise<ActionResult> {
-    return this.run("swapFromNative", this.buildSwapFromNative(params));
+  async swapFromNative(params: Parameters<BvccAgentClient["buildSwapFromNative"]>[0]): Promise<ActionResult> {
+    const feeOnTop = params.feeOnTop ?? (await this.walletVersion()) === "v5";
+    return this.run("swapFromNative", this.buildSwapFromNative({ ...params, feeOnTop }));
   }
 
   /** ABI-encode a batch into `executionData` for `executeAsAgent`. */
@@ -383,17 +527,34 @@ export class BvccAgentClient {
 
   /** Submit a batch of executions via `executeAsAgent`. Returns the tx hash. */
   async execute(executions: Execution[]): Promise<Hex> {
-    const data = encodeFunctionData({
-      abi: agentWalletAbi,
-      functionName: "executeAsAgent",
-      args: [BATCH_MODE, this.encodeExecutions(executions)],
+    const batch = await this.prepareBatch(executions);
+    const data = this.agentCalldata(batch);
+    // Estimate first: a batch that would revert throws here and is never sent. Then
+    // send with a margin, because the exact estimate runs out of gas when the state
+    // moves a little before the transaction is mined.
+    const estimated = await this.publicClient.estimateGas({
+      account: this.account.address,
+      to: this.walletAddress,
+      data,
     });
+    const gas = (estimated * BigInt(10_000 + this.gasBufferBps)) / 10_000n;
     return this.walletClient.sendTransaction({
       account: this.account,
       chain: this.walletClient.chain,
       to: this.walletAddress,
       data,
+      gas,
     });
+  }
+
+  /** `executeAsAgent` calldata for a prepared batch, with the source tag when enabled. */
+  private agentCalldata(batch: Execution[]): Hex {
+    const call = encodeFunctionData({
+      abi: agentWalletAbi,
+      functionName: "executeAsAgent",
+      args: [BATCH_MODE, this.encodeExecutions(batch)],
+    });
+    return this.sourceTagHex ? concat([call, this.sourceTagHex]) : call;
   }
 
   /** Submit a batch and wait for the receipt. */
@@ -403,12 +564,61 @@ export class BvccAgentClient {
   }
 
   /** Send native currency. Returns a structured {@link ActionResult}. */
-  sendNative(to: Address, amountWei: bigint): Promise<ActionResult> {
+  async sendNative(to: Address, amountWei: bigint): Promise<ActionResult> {
+    const short = await this.feeRoomShortfall("native", amountWei);
+    if (short) return fail("sendNative", short, this.ctx());
     return this.run("sendNative", [this.buildSendNative(to, amountWei)]);
   }
 
+  /**
+   * The most the agent can move of a token (or `"native"`) out of the wallet's
+   * current balance. On wallet V5 the 0.15% agent fee is paid on top of the amount
+   * from the same balance, so moving the whole balance fails; this leaves room for it.
+   * Earlier generations: the balance itself.
+   */
+  async maxSpendable(token: Address | "native"): Promise<bigint> {
+    const balance =
+      token === "native"
+        ? await this.publicClient.getBalance({ address: this.walletAddress })
+        : ((await this.publicClient.readContract({
+            address: token,
+            abi: erc20Abi,
+            functionName: "balanceOf",
+            args: [this.walletAddress],
+          })) as bigint);
+    if ((await this.walletVersion()) !== "v5") return balance;
+    // Largest x with x + floor(x * 1500 / 1e6) <= balance.
+    let x = (balance * 1_000_000n) / 1_001_500n;
+    while (withAgentFee(x + 1n) <= balance) x += 1n;
+    while (x > 0n && withAgentFee(x) > balance) x -= 1n;
+    return x;
+  }
+
+  /**
+   * On V5, a move the balance covers but the fee on top does not: explain it before
+   * any gas is spent, naming the most that can be moved. Null when it fits (or pre-V5).
+   */
+  private async feeRoomShortfall(token: Address | "native", amount: bigint): Promise<DecodedRevert | null> {
+    if ((await this.walletVersion()) !== "v5") return null;
+    const max = await this.maxSpendable(token);
+    if (amount <= max) return null;
+    const bal = token === "native" ? await this.getNativeBalance() : await this.getTokenBalance(token);
+    if (amount > bal.raw) return null; // simply not enough: the chain's own error says so
+    const human = `${formatUnits(max, bal.decimals)} ${bal.symbol}`;
+    return {
+      errorName: "NoRoomForFee",
+      humanMessage: `The wallet holds this amount, but not the 0.15% agent fee paid on top of it. The most that can be moved now is ${human}.`,
+      suggestedAction: `Send at most ${human}, not the whole balance.`,
+      rawError: `amount ${amount} > maxSpendable ${max}`,
+      retryable: false,
+    };
+  }
+
+
   /** Send an ERC-20 token. Returns a structured {@link ActionResult}. */
-  sendToken(token: Address, to: Address, amount: bigint): Promise<ActionResult> {
+  async sendToken(token: Address, to: Address, amount: bigint): Promise<ActionResult> {
+    const short = await this.feeRoomShortfall(token, amount);
+    if (short) return fail("sendToken", short, this.ctx());
     return this.run("sendToken", [this.buildSendToken(token, to, amount)]);
   }
 
@@ -591,7 +801,7 @@ export class BvccAgentClient {
    * chosen range. Falls back to the naive `buildAddLiquidityV3` only if no factory
    * is configured for the chain. Async (reads the pool); use for real mints.
    */
-  async planAddLiquidityV3(params: {
+  async planAddLiquidityV3(params: LiquidityRangeParams & {
     tokenA: Address;
     amountA: bigint;
     tokenB: Address;
@@ -604,9 +814,20 @@ export class BvccAgentClient {
     nfpm?: Address;
     factory?: Address;
   }): Promise<Execution[]> {
+    return (await this.planAddLiquidityV3Detailed(params)).executions;
+  }
+
+  /**
+   * {@link planAddLiquidityV3} plus the range it resolved, read against the pool's
+   * current price (with warnings). A range that does not contain the current price is
+   * refused unless `allowOutOfRange` is set.
+   */
+  async planAddLiquidityV3Detailed(
+    params: Parameters<BvccAgentClient["planAddLiquidityV3"]>[0],
+  ): Promise<{ executions: Execution[]; range: RangeInfo | null }> {
     const factory = params.factory ?? this.network.v3Factory;
     // No factory → cannot read the price; fall back to the caller's raw amounts.
-    if (!factory) return this.buildAddLiquidityV3(params);
+    if (!factory) return { executions: this.buildAddLiquidityV3(params), range: null };
 
     const nfpm = this.lpNfpm(params.nfpm);
     const { token0, token1, amount0: amount0Max, amount1: amount1Max } = orderV3Tokens(
@@ -616,18 +837,27 @@ export class BvccAgentClient {
       params.amountB,
     );
 
+    const aIsToken0 = token0.toLowerCase() === params.tokenA.toLowerCase();
+    const [metaA, metaB] = await Promise.all([this.lpTokenMeta(params.tokenA), this.lpTokenMeta(params.tokenB)]);
+    const spacing = feeToTickSpacing(params.fee);
     let tickLower: number;
     let tickUpper: number;
-    if (params.tickLower != null && params.tickUpper != null) {
-      const spacing = feeToTickSpacing(params.fee);
+    let fullRange = false;
+    const fromPrices = this.ticksFromPrices(params, metaA.decimals, metaB.decimals, aIsToken0);
+    if (fromPrices) {
+      tickLower = alignTickDown(fromPrices.tickLower, spacing);
+      tickUpper = alignTickUp(fromPrices.tickUpper, spacing);
+    } else if (params.tickLower != null && params.tickUpper != null) {
       tickLower = nearestUsableTick(params.tickLower, spacing);
       tickUpper = nearestUsableTick(params.tickUpper, spacing);
-      if (tickLower >= tickUpper) throw new Error("tickLower must be < tickUpper after alignment.");
     } else {
       ({ tickLower, tickUpper } = fullRangeTicks(params.fee));
+      fullRange = true;
     }
+    if (tickLower >= tickUpper) throw new Error("tickLower must be < tickUpper after alignment.");
 
     const sqrtP = await this.getV3PoolSqrtPrice(token0, token1, params.fee, factory);
+    const range = this.checkRange(sqrtP, tickLower, tickUpper, metaA, metaB, aIsToken0, fullRange, params.allowOutOfRange);
     const sqrtA = getSqrtRatioAtTick(tickLower);
     const sqrtB = getSqrtRatioAtTick(tickUpper);
     const liquidity = getLiquidityForAmounts(sqrtP, sqrtA, sqrtB, amount0Max, amount1Max);
@@ -638,7 +868,7 @@ export class BvccAgentClient {
     const { amount0, amount1 } = amountsForLiquidity(sqrtP, tickLower, tickUpper, liquidity);
     const slip = params.slippageBps ?? 50;
 
-    return buildMintV3({
+    const executions = buildMintV3({
       nfpm,
       token0,
       token1,
@@ -652,13 +882,20 @@ export class BvccAgentClient {
       recipient: this.walletAddress,
       deadline: params.deadline,
     });
+    return { executions, range };
   }
 
   /** Open a v3 position (amounts auto-balanced to the pool ratio). Structured result. */
   async addLiquidityV3(
     params: Parameters<BvccAgentClient["planAddLiquidityV3"]>[0],
-  ): Promise<ActionResult> {
-    return this.run("addLiquidityV3", await this.planAddLiquidityV3(params));
+  ): Promise<ActionResult & { range?: RangeInfo | null }> {
+    let plan: Awaited<ReturnType<BvccAgentClient["planAddLiquidityV3Detailed"]>>;
+    try {
+      plan = await this.planAddLiquidityV3Detailed(params);
+    } catch (e) {
+      return fail("addLiquidityV3", planningFailure(e), this.ctx());
+    }
+    return { ...(await this.run("addLiquidityV3", plan.executions)), range: plan.range };
   }
 
   /** Build a collect-fees batch (recipient = wallet). */
@@ -729,8 +966,15 @@ export class BvccAgentClient {
   /** Dry-run: open a v3 position (amounts auto-balanced to the pool ratio). */
   async dryRunAddLiquidityV3(
     params: Parameters<BvccAgentClient["planAddLiquidityV3"]>[0],
-  ): Promise<DryRunResult> {
-    return this.dryRun("addLiquidityV3", await this.planAddLiquidityV3(params));
+  ): Promise<DryRunResult & { range?: RangeInfo | null }> {
+    let plan: Awaited<ReturnType<BvccAgentClient["planAddLiquidityV3Detailed"]>>;
+    try {
+      plan = await this.planAddLiquidityV3Detailed(params);
+    } catch (e) {
+      const range = e instanceof OutOfRangeError ? e.range : undefined;
+      return { ok: false, action: "addLiquidityV3", estimatedGas: null, estimatedNetworkFeeWei: null, preview: [], failure: planningFailure(e), range };
+    }
+    return { ...(await this.dryRun("addLiquidityV3", plan.executions)), range: plan.range };
   }
 
   /** Dry-run: remove liquidity. */
@@ -799,7 +1043,7 @@ export class BvccAgentClient {
    * `tickSpacing` is given). `hooks` defaults to none (address(0)); a hooked pool
    * only works if that hook is approved in the BVCCHookRegistry.
    */
-  async planAddLiquidityV4(params: {
+  async planAddLiquidityV4(params: LiquidityRangeParams & {
     tokenA: Address;
     amountA: bigint;
     tokenB: Address;
@@ -814,6 +1058,13 @@ export class BvccAgentClient {
     positionManager?: Address;
     stateView?: Address;
   }): Promise<Execution[]> {
+    return (await this.planAddLiquidityV4Detailed(params)).executions;
+  }
+
+  /** {@link planAddLiquidityV4} plus the resolved range and its warnings (see the v3 one). */
+  async planAddLiquidityV4Detailed(
+    params: Parameters<BvccAgentClient["planAddLiquidityV4"]>[0],
+  ): Promise<{ executions: Execution[]; range: RangeInfo | null }> {
     const pm = this.lpPmV4(params.positionManager);
     const tickSpacing = params.tickSpacing ?? feeToTickSpacing(params.fee);
     const hooks = params.hooks ?? V4_NATIVE;
@@ -821,18 +1072,27 @@ export class BvccAgentClient {
     const amount0Max = flipped ? params.amountB : params.amountA;
     const amount1Max = flipped ? params.amountA : params.amountB;
 
+    const aIsToken0 = !flipped;
+    const [metaA, metaB] = await Promise.all([this.lpTokenMeta(params.tokenA), this.lpTokenMeta(params.tokenB)]);
     let tickLower: number;
     let tickUpper: number;
-    if (params.tickLower != null && params.tickUpper != null) {
+    let fullRange = false;
+    const fromPrices = this.ticksFromPrices(params, metaA.decimals, metaB.decimals, aIsToken0);
+    if (fromPrices) {
+      tickLower = alignTickDown(fromPrices.tickLower, tickSpacing);
+      tickUpper = alignTickUp(fromPrices.tickUpper, tickSpacing);
+    } else if (params.tickLower != null && params.tickUpper != null) {
       tickLower = nearestUsableTick(params.tickLower, tickSpacing);
       tickUpper = nearestUsableTick(params.tickUpper, tickSpacing);
-      if (tickLower >= tickUpper) throw new Error("tickLower must be < tickUpper after alignment.");
     } else {
       tickLower = alignTickUp(MIN_TICK, tickSpacing);
       tickUpper = alignTickDown(MAX_TICK, tickSpacing);
+      fullRange = true;
     }
+    if (tickLower >= tickUpper) throw new Error("tickLower must be < tickUpper after alignment.");
 
     const sqrtP = await this.getV4PoolSqrtPrice(key, params.stateView);
+    const range = this.checkRange(sqrtP, tickLower, tickUpper, metaA, metaB, aIsToken0, fullRange, params.allowOutOfRange);
     const liquidity = getLiquidityForAmounts(
       sqrtP,
       getSqrtRatioAtTick(tickLower),
@@ -842,7 +1102,7 @@ export class BvccAgentClient {
     );
     if (liquidity <= 0n) throw new Error("Could not size any liquidity from the given amounts — increase one side.");
 
-    return buildMintV4({
+    const executions = buildMintV4({
       positionManager: pm,
       key,
       tickLower,
@@ -853,13 +1113,68 @@ export class BvccAgentClient {
       recipient: this.walletAddress,
       deadline: params.deadline,
     });
+    return { executions, range };
+  }
+
+  /** Decimals and symbol for a pool currency (native = the chain's currency, 18). */
+  private async lpTokenMeta(token: Address): Promise<{ decimals: number; symbol: string }> {
+    if (token.toLowerCase() === V4_NATIVE.toLowerCase()) return { decimals: 18, symbol: this.network.currency };
+    const b = await this.getTokenBalance(token);
+    return { decimals: b.decimals, symbol: b.symbol };
+  }
+
+  /** priceLower/priceUpper → ticks, or null when the caller gave no prices. */
+  private ticksFromPrices(
+    p: LiquidityRangeParams,
+    decimalsA: number,
+    decimalsB: number,
+    aIsToken0: boolean,
+  ): { tickLower: number; tickUpper: number } | null {
+    if (p.priceLower == null && p.priceUpper == null) return null;
+    if (p.priceLower == null || p.priceUpper == null)
+      throw new Error("Pass both priceLower and priceUpper (tokenA per tokenB), or neither.");
+    return pricesToTicks(Number(p.priceLower), Number(p.priceUpper), decimalsA, decimalsB, aIsToken0);
+  }
+
+  /** Read a range against the pool price; refuse an out-of-range one unless allowed. */
+  private checkRange(
+    sqrtP: bigint,
+    tickLower: number,
+    tickUpper: number,
+    metaA: { decimals: number; symbol: string },
+    metaB: { decimals: number; symbol: string },
+    aIsToken0: boolean,
+    fullRange: boolean,
+    allowOutOfRange?: boolean,
+  ): RangeInfo {
+    const range = describeRange({
+      tickLower,
+      tickUpper,
+      currentTick: tickFromSqrtPrice(sqrtP),
+      decimalsA: metaA.decimals,
+      decimalsB: metaB.decimals,
+      aIsToken0,
+      symbolA: metaA.symbol,
+      symbolB: metaB.symbol,
+      fullRange,
+    });
+    if (!fullRange && !range.inRange && !allowOutOfRange) {
+      throw new OutOfRangeError(range);
+    }
+    return range;
   }
 
   /** Open a v4 position (native ETH supported). Structured result. */
   async addLiquidityV4(
     params: Parameters<BvccAgentClient["planAddLiquidityV4"]>[0],
-  ): Promise<ActionResult> {
-    return this.run("addLiquidityV4", await this.planAddLiquidityV4(params));
+  ): Promise<ActionResult & { range?: RangeInfo | null }> {
+    let plan: Awaited<ReturnType<BvccAgentClient["planAddLiquidityV4Detailed"]>>;
+    try {
+      plan = await this.planAddLiquidityV4Detailed(params);
+    } catch (e) {
+      return fail("addLiquidityV4", planningFailure(e), this.ctx());
+    }
+    return { ...(await this.run("addLiquidityV4", plan.executions)), range: plan.range };
   }
 
   /** Build a remove-liquidity (or burn) batch for a v4 position, proceeds to wallet. */
@@ -954,8 +1269,15 @@ export class BvccAgentClient {
   /** Dry-run: open a v4 position. */
   async dryRunAddLiquidityV4(
     params: Parameters<BvccAgentClient["planAddLiquidityV4"]>[0],
-  ): Promise<DryRunResult> {
-    return this.dryRun("addLiquidityV4", await this.planAddLiquidityV4(params));
+  ): Promise<DryRunResult & { range?: RangeInfo | null }> {
+    let plan: Awaited<ReturnType<BvccAgentClient["planAddLiquidityV4Detailed"]>>;
+    try {
+      plan = await this.planAddLiquidityV4Detailed(params);
+    } catch (e) {
+      const range = e instanceof OutOfRangeError ? e.range : undefined;
+      return { ok: false, action: "addLiquidityV4", estimatedGas: null, estimatedNetworkFeeWei: null, preview: [], failure: planningFailure(e), range };
+    }
+    return { ...(await this.dryRun("addLiquidityV4", plan.executions)), range: plan.range };
   }
 
   /** Dry-run: remove v4 liquidity. */
@@ -982,6 +1304,42 @@ export class BvccAgentClient {
 
   /** Read this agent's full on-chain permission struct. */
   async getPermission(agent: Address = this.agentAddress): Promise<AgentPermission> {
+    if ((await this.walletVersion()) === "v5") {
+      // V5 splits the struct: limits and flags here, spending in getAgentSpending.
+      const [p, sp] = await Promise.all([
+        this.publicClient.readContract({
+          address: this.walletAddress,
+          abi: agentWalletV5Abi,
+          functionName: "getAgentPermission",
+          args: [agent],
+        }),
+        this.publicClient.readContract({
+          address: this.walletAddress,
+          abi: agentWalletV5Abi,
+          functionName: "getAgentSpending",
+          args: [agent],
+        }),
+      ]);
+      return {
+        maxPerTxWei: p.maxPerTxWei,
+        dailyLimitWei: p.dailyLimitWei,
+        totalBudgetWei: p.totalBudgetWei,
+        totalSpentWei: sp.totalSpentWei,
+        periodBudgetWei: p.periodBudgetWei,
+        periodSpentWei: sp.periodSpentWei,
+        allowedTokens: p.allowedTokens,
+        tokenMaxAmounts: p.tokenMaxAmounts,
+        tokenDailyLimits: p.tokenDailyLimits,
+        tokenTotalBudgets: p.tokenTotalBudgets,
+        allowedProtocols: p.allowedProtocols,
+        allowedRecipients: p.allowedRecipients,
+        expiry: BigInt(p.expiry),
+        periodDuration: BigInt(p.periodDuration),
+        periodStart: BigInt(sp.periodStart),
+        active: p.active,
+        paused: p.paused,
+      };
+    }
     const p = (await this.publicClient.readContract({
       address: this.walletAddress,
       abi: agentWalletAbi,
@@ -1029,6 +1387,7 @@ export class BvccAgentClient {
    * `null` means that limit is unlimited / disabled on-chain.
    */
   async getRemaining(agent: Address = this.agentAddress): Promise<RemainingBudget> {
+    const v5 = (await this.walletVersion()) === "v5";
     const perm = await this.getPermission(agent);
     const dailySpentNative = await this.getDailySpentNative(agent);
 
@@ -1062,19 +1421,21 @@ export class BvccAgentClient {
         totalBudget,
         dailySpent,
         totalSpent,
-        dailyRemaining: subOrNull(dailyLimit, dailySpent),
-        totalRemaining: subOrNull(totalBudget, totalSpent),
+        dailyRemaining: remainingUnder(dailyLimit, dailySpent, v5),
+        totalRemaining: remainingUnder(totalBudget, totalSpent, v5),
       });
     }
 
     return {
       active: perm.active,
       expired,
-      maxPerTxWei: perm.maxPerTxWei === 0n ? null : perm.maxPerTxWei,
-      dailyRemainingWei: subOrNull(perm.dailyLimitWei, dailySpentNative),
-      totalRemainingWei: subOrNull(perm.totalBudgetWei, perm.totalSpentWei),
+      maxPerTxWei: v5
+        ? v5Unlimited(perm.maxPerTxWei) ? null : perm.maxPerTxWei
+        : perm.maxPerTxWei === 0n ? null : perm.maxPerTxWei,
+      dailyRemainingWei: remainingUnder(perm.dailyLimitWei, dailySpentNative, v5),
+      totalRemainingWei: remainingUnder(perm.totalBudgetWei, perm.totalSpentWei, v5),
       periodRemainingWei: periodEnabled
-        ? subOrNull(perm.periodBudgetWei, periodSpent)
+        ? remainingUnder(perm.periodBudgetWei, periodSpent, v5)
         : null,
       periodResetsInSeconds,
       tokens,
@@ -1087,10 +1448,19 @@ export class BvccAgentClient {
    * common reverts before you pay for a failed transaction.
    */
   async canSpendNative(amountWei: bigint, agent: Address = this.agentAddress): Promise<PreflightResult> {
+    const v5 = (await this.walletVersion()) === "v5";
     const r = await this.getRemaining(agent);
     if (!r.active) return { ok: false, reason: "Agent is not active (revoked or never authorized)." };
     if (r.expired) return { ok: false, reason: "Agent permissions have expired." };
     if (await this.isPaused()) return { ok: false, reason: "All agents are paused on this wallet." };
+    if (v5) {
+      const perm = await this.getPermission(agent);
+      if (perm.paused) return { ok: false, reason: "The owner has paused this agent." };
+      if (perm.allowedRecipients.length === 0)
+        return { ok: false, reason: "This agent has no allowed recipients, so it cannot send to anyone (wallet V5)." };
+      // V5 limits count the 0.15% agent fee too.
+      amountWei = withAgentFee(amountWei);
+    }
     if (r.maxPerTxWei !== null && amountWei > r.maxPerTxWei)
       return { ok: false, reason: `Exceeds per-tx limit (${r.maxPerTxWei} wei).` };
     if (r.dailyRemainingWei !== null && amountWei > r.dailyRemainingWei)
@@ -1108,12 +1478,18 @@ export class BvccAgentClient {
     amount: bigint,
     agent: Address = this.agentAddress,
   ): Promise<PreflightResult> {
+    const v5 = (await this.walletVersion()) === "v5";
     const r = await this.getRemaining(agent);
     if (!r.active) return { ok: false, reason: "Agent is not active." };
     if (r.expired) return { ok: false, reason: "Agent permissions have expired." };
     const tb = r.tokens.find((t) => t.token.toLowerCase() === token.toLowerCase());
     if (!tb) return { ok: false, reason: `Token ${token} is not in the agent's allowedTokens whitelist.` };
-    if (tb.maxPerTx !== 0n && amount > tb.maxPerTx)
+    if (v5) {
+      // V5: 0 allows nothing, max allows anything, and the agent fee counts too.
+      amount = withAgentFee(amount);
+      if (!v5Unlimited(tb.maxPerTx) && amount > tb.maxPerTx)
+        return { ok: false, reason: `Exceeds per-operation token limit (${tb.maxPerTx}, fee included).` };
+    } else if (tb.maxPerTx !== 0n && amount > tb.maxPerTx)
       return { ok: false, reason: `Exceeds per-tx token limit (${tb.maxPerTx}).` };
     if (tb.dailyRemaining !== null && amount > tb.dailyRemaining)
       return { ok: false, reason: `Exceeds remaining daily token limit (${tb.dailyRemaining} left).` };
@@ -1161,16 +1537,25 @@ export class BvccAgentClient {
 
   /** Simulate a batch and estimate gas without sending. */
   async dryRun(action: ActionName, executions: Execution[]): Promise<DryRunResult> {
-    const preview = executions.map((e) => ({
+    let batch: Execution[];
+    try {
+      batch = await this.prepareBatch(executions);
+    } catch (e) {
+      return {
+        ok: false,
+        action,
+        estimatedGas: null,
+        estimatedNetworkFeeWei: null,
+        preview: [],
+        failure: decodeRevert(e),
+      };
+    }
+    const preview = batch.map((e) => ({
       target: e.target,
       value: e.value,
       selector: (e.callData && e.callData !== "0x" ? slice(e.callData, 0, 4) : "0x") as Hex,
     }));
-    const data = encodeFunctionData({
-      abi: agentWalletAbi,
-      functionName: "executeAsAgent",
-      args: [BATCH_MODE, this.encodeExecutions(executions)],
-    });
+    const data = this.agentCalldata(batch);
     try {
       const estimatedGas = await this.publicClient.estimateGas({
         account: this.account.address,
@@ -1202,10 +1587,14 @@ export class BvccAgentClient {
     return this.dryRun(action, executions);
   }
 
-  dryRunSendNative(to: Address, amountWei: bigint): Promise<DryRunResult> {
+  async dryRunSendNative(to: Address, amountWei: bigint): Promise<DryRunResult> {
+    const short = await this.feeRoomShortfall("native", amountWei);
+    if (short) return { ok: false, action: "sendNative", estimatedGas: null, estimatedNetworkFeeWei: null, preview: [], failure: short };
     return this.dryRun("sendNative", [this.buildSendNative(to, amountWei)]);
   }
-  dryRunSendToken(token: Address, to: Address, amount: bigint): Promise<DryRunResult> {
+  async dryRunSendToken(token: Address, to: Address, amount: bigint): Promise<DryRunResult> {
+    const short = await this.feeRoomShortfall(token, amount);
+    if (short) return { ok: false, action: "sendToken", estimatedGas: null, estimatedNetworkFeeWei: null, preview: [], failure: short };
     return this.dryRun("sendToken", [this.buildSendToken(token, to, amount)]);
   }
   dryRunApprove(token: Address, spender: Address, amount: bigint): Promise<DryRunResult> {
@@ -1224,9 +1613,15 @@ export class BvccAgentClient {
 
   /** High-level snapshot of the agent's on-chain authorization. */
   async getAgentStatus(agent: Address = this.agentAddress): Promise<AgentStatus> {
-    const [p, isPaused] = await Promise.all([this.getPermission(agent), this.isPaused()]);
+    const [p, walletPaused, walletVersion] = await Promise.all([
+      this.getPermission(agent),
+      this.isPaused(),
+      this.walletVersion(),
+    ]);
+    const isPaused = walletPaused || p.paused === true;
     const now = BigInt(Math.floor(Date.now() / 1000));
     return {
+      walletVersion,
       walletAddress: this.walletAddress,
       agentAddress: agent,
       network: this.network.name,
@@ -1242,6 +1637,133 @@ export class BvccAgentClient {
   }
 
   /**
+   * V5: what the agent can do. Every protocol call needs this agent's own policy, an
+   * active validator and a target the owner has not blocked; swaps and v4 liquidity
+   * also pull through Permit2 allowances the owner granted. All of it is read here,
+   * so a `true` flag means the wallet is set up for that action.
+   */
+  private async getCapabilitiesV5(agent: Address): Promise<Capabilities> {
+    const ur = this.network.universalRouter;
+    const pm = this.network.positionManagerV4;
+    const aave = getAaveAddresses(this.network.chainId)?.pool;
+    const [p, walletPaused, registry] = await Promise.all([
+      this.getPermission(agent),
+      this.isPaused(),
+      this.publicClient.readContract({
+        address: this.walletAddress,
+        abi: agentWalletV5Abi,
+        functionName: "VALIDATOR_REGISTRY",
+      }) as Promise<Address>,
+    ]);
+    const now = BigInt(Math.floor(Date.now() / 1000));
+    const expired = p.expiry !== 0n && now >= p.expiry;
+    const live = p.active && !expired && !walletPaused && p.paused !== true;
+    const protos = p.allowedProtocols.map((a) => a.toLowerCase());
+    const has = (a?: Address) => !!a && protos.includes(a.toLowerCase());
+    const hasTokens = p.allowedTokens.length > 0;
+    const hasRecipients = p.allowedRecipients.length > 0;
+    const ethAllowed = p.maxPerTxWei !== 0n && p.dailyLimitWei !== 0n && p.totalBudgetWei !== 0n;
+
+    // One protocol route: policy for this agent, a live validator, not blocked.
+    const route = async (target: Address | undefined, selector: Hex) => {
+      if (!target || !has(target)) return { ok: false, policy: null, validator: null, blocked: false };
+      const [policy, validator, blocked] = await Promise.all([
+        getPolicy(this.publicClient, this.walletAddress, target, selector, agent),
+        getActiveValidator(this.publicClient, registry, target),
+        this.publicClient.readContract({
+          address: this.walletAddress,
+          abi: agentWalletV5Abi,
+          functionName: "isTargetBlocked",
+          args: [target],
+        }) as Promise<boolean>,
+      ]);
+      return { ok: policy.allowed && policy.deep && !!validator && !blocked, policy, validator, blocked };
+    };
+    const nfpm = this.network.nfpm;
+    const weth = this.network.weth;
+    const [rUr, rPm, rAave, rV3, rWrap] = await Promise.all([
+      route(ur, SELECTORS.urExecute),
+      route(pm, "0xdd46508f"),
+      route(aave, "0x617ba037"),
+      route(nfpm, "0x88316456"),
+      route(weth, "0xd0e30db0"),
+    ]);
+
+    const notes: string[] = [];
+    if (!p.active) notes.push("Agent is not active (revoked or never authorized).");
+    if (expired) notes.push("Agent permissions have expired.");
+    if (walletPaused) notes.push("All agents are paused on this wallet.");
+    if (p.paused) notes.push("The owner has paused this agent.");
+    notes.push(
+      "Wallet V5: a limit of 0 allows nothing, limits include the 0.15% agent fee, and an empty recipient list means no recipient.",
+    );
+    if (!ethAllowed) notes.push("ETH limits are 0 — the agent cannot move ETH.");
+    if (!hasRecipients) notes.push("No allowed recipients — the agent cannot send ETH or tokens to anyone.");
+    if (!hasTokens) notes.push("No tokens whitelisted — token transfers, swaps and DeFi are denied.");
+
+    const missingPolicies: MissingPolicy[] = [];
+    const describe = (
+      label: string,
+      action: string,
+      target: Address | undefined,
+      selector: `0x${string}`,
+      r: Awaited<ReturnType<typeof route>>,
+    ) => {
+      if (!target || !has(target)) return;
+      if (r.blocked) notes.push(`The owner has blocked ${label} for every agent.`);
+      if (r.policy && !(r.policy.allowed && r.policy.deep)) {
+        missingPolicies.push({ action, protocol: target, selector, label });
+      }
+      if (!r.validator) notes.push(`No validator is active yet for ${label}; calls to it fail closed.`);
+    };
+    describe("the Universal Router", "swapV4", ur, SELECTORS.urExecute, rUr);
+    describe("the Uniswap v4 PositionManager", "addLiquidityV4", pm, "0xdd46508f", rPm);
+    describe("the Aave Pool", "aaveSupply", aave, "0x617ba037", rAave);
+    describe("the Uniswap v3 position manager", "addLiquidityV3", nfpm, "0x88316456", rV3);
+    describe("the wrapped native token", "swapFromNative", weth, "0xd0e30db0", rWrap);
+    if (missingPolicies.length > 0)
+      notes.push("Some call policies are missing for this agent. The owner adds them by editing the agent in the dashboard.");
+
+    // Swaps pull through Permit2 allowances the owner granted when authorizing the agent.
+    if (rUr.ok && ur) {
+      const nowSec = Math.floor(Date.now() / 1000);
+      const missing: string[] = [];
+      for (const token of p.allowedTokens) {
+        try {
+          const a = await this.getPermit2Allowance(token, ur);
+          if (a.amount === 0n || (a.expiration !== 0 && a.expiration <= nowSec)) missing.push(token);
+        } catch {
+          missing.push(token);
+        }
+      }
+      if (missing.length > 0)
+        notes.push(
+          `No live Permit2 allowance to the Universal Router for ${missing.join(", ")}. The owner grants it by renewing the agent.`,
+        );
+    }
+    notes.push(
+      "Not available to agents on V5: SwapRouter02 (swaps are routed through the Universal Router automatically) and Aave repayWithATokens. " +
+        "Uniswap v3 liquidity and wrapping the native coin work where their validators are active and the owner allowed them for this agent.",
+    );
+
+    const canSwap = live && hasTokens && rUr.ok;
+    return {
+      canSendNative: live && ethAllowed && hasRecipients,
+      canSendTokens: live && hasTokens && hasRecipients,
+      canApprove: live && hasTokens && p.allowedProtocols.length > 0,
+      canSwapV3: canSwap,
+      canSwapV4: canSwap,
+      canProvideLiquidityV3: live && hasTokens && rV3.ok,
+      canWrapNative: live && rWrap.ok,
+      allowedSwapTokens: p.allowedTokens,
+      allowedProtocols: p.allowedProtocols,
+      notes,
+      walletVersion: "v5",
+      missingPolicies,
+    };
+  }
+
+  /**
    * Derive what the agent can currently do.
    *
    * On V3 wallets the permission struct is only half the answer: Case-3 calls also
@@ -1251,6 +1773,7 @@ export class BvccAgentClient {
    * the registry kill-switch. So on V3 the swap flags are also gated on policies.
    */
   async getCapabilities(agent: Address = this.agentAddress): Promise<Capabilities> {
+    if ((await this.walletVersion()) === "v5") return this.getCapabilitiesV5(agent);
     const [p, isPaused, walletVersion] = await Promise.all([
       this.getPermission(agent),
       this.isPaused(),

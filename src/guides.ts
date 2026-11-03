@@ -53,11 +53,12 @@ export const GUIDES: readonly Guide[] = [
     workflow: [
       "Setup (one-time, done by the owner): create a BVCC Agent Wallet and authorize this agent's address with on-chain limits (allowed tokens, protocols, recipients, and spend caps). The agent's key signs and pays its own gas from a small ETH balance.",
       "Orient: getAgentStatus (authorized? expired? paused? + the rules) and getCapabilities (what you may do, with notes explaining any blocker).",
-      "Check funds and headroom: getNativeBalance, getTokenBalances, getRemaining (how much of each limit is left; a null limit means unlimited/disabled).",
+      "Check funds and headroom: getNativeBalance, getTokenBalances, getRemaining (how much of each limit is left; a null limit means unlimited; on wallet V5 a 0 limit means not allowed).",
       "Preview before writing: a dryRun* tool (dryRunSendNative / dryRunSendToken) shows gas and any revert reason before you spend gas.",
       "Act: sendNative / sendToken (or the swap/lending/liquidity tools). A blocked action reverts on-chain — read the humanMessage/suggestedAction and adjust; do not retry blindly.",
     ],
     gotchas: [
+      "Wallet V5 (getCapabilities reports walletVersion): a limit of 0 allows nothing and an empty recipient list allows no recipient \u2014 ask the owner rather than retrying. Limits are checked on the amount plus a small on-chain charge, so stay a little under a limit. The owner can pause this agent alone, block a contract for every agent, and renew the expiry.",
       "The contract enforces every limit. The SDK only predicts — a passing dryRun is not a guarantee, since state can change before the tx lands.",
       "You pay gas from the agent's own ETH balance; keep it funded or transactions fail to send.",
       "Recipient whitelist: when active, sends only reach listed addresses; an empty whitelist means any recipient is allowed.",
@@ -89,6 +90,7 @@ export const GUIDES: readonly Guide[] = [
       "Native ETH: swapToNative (token → ETH) and swapFromNative (ETH → token); or swapV4 with nativeOut to receive ETH from a v4 native pool.",
     ],
     gotchas: [
+      "Wallet V5: swaps run only through the Universal Router (SwapRouter02-style swaps are routed there automatically), between ERC-20 tokens. Swaps to or from the native coin work only where wrapping is active for the agent (getCapabilities \u2192 canWrapNative); otherwise use WETH. The Permit2 allowance is the owner's: if a swap reports a missing or expired allowance, ask the owner to renew the agent.",
       "amountOutMinimum is your slippage floor — pass it (or slippageBps). '0' is refused. Quote close to when you swap.",
       "The per-token per-tx limit is consumed by the approve cap / amountInMaximum, not by what is actually spent — leave headroom for the cap.",
       "swapV4 needs BOTH the Universal Router and Permit2 in allowedProtocols, and tokenIn in allowedTokens.",
@@ -120,6 +122,7 @@ export const GUIDES: readonly Guide[] = [
       "Unwinding: call a planner FIRST (aavePlanClosePosition / aavePlanDeleverage / aavePlanCollateralSwap / aavePlanDebtSwap) to see the chunks and where health lands, THEN run the matching write (aaveClosePosition / aaveDeleverage / aaveCollateralSwap / aaveDebtSwap). One execute may broadcast several transactions.",
     ],
     gotchas: [
+      "Wallet V5: after the batch the health factor must stay at or above 1.2, even where Aave would allow less. repayWithATokens is not available \u2014 repay with the underlying asset instead.",
       "Unwinding runs a chunked loop; slippageBps is required. It stops rather than proceeds if a chunk would push health below hfFloor (default 1.05), if a swap prices too far from the Aave oracle, if the loop stops reducing debt, or if the budget would run out — read the abort reason.",
       "You cannot withdraw collateral that backs debt; that is why unwinding works in chunks. If a position is too tight to chunk, the abort tells you how much to repay from the wallet to unblock it.",
       "aaveRepayWithATokens repays from your aTokens without a swap; aaveSetCollateral and aaveSetEMode change position configuration.",
@@ -161,6 +164,7 @@ export const GUIDES: readonly Guide[] = [
       "Close: removeLiquidityV3 / removeLiquidityV4 with { tokenId, bps, burn } (bps 10000 = all; burn: true also burns the emptied NFT). burnV3 / burnV4 burn an already-empty NFT.",
     ],
     gotchas: [
+      "Wallet V5: Uniswap v4 liquidity is available; v3 liquidity only where its validator is active for the agent (getCapabilities \u2192 canProvideLiquidityV3). The Permit2 allowance to the v4 PositionManager is the owner's; a single v4 call may not both remove liquidity and add it to another position.",
       "There is no increaseLiquidity — to add to an existing position you mint a fresh one (the v3 NFPM's increase is not owner-gated, so it is deliberately excluded).",
       "amountA/amountB are maximums; after sizing to the pool ratio one side is usually only partly used.",
       "The position NFT is minted to the wallet and every proceed returns to the wallet — pinned on-chain.",

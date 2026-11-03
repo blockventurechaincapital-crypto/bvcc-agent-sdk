@@ -64,9 +64,10 @@ export const TOKENS: Record<number, Record<string, TokenInfo>> = {
     DAI: { address: "0x8f3Cf7ad23Cd3CaDbD9735AFf958023239c6A063", symbol: "DAI", decimals: 18 },
     WBTC: { address: "0x1BFD67037B42Cf73acF2047067bd4F2C47D9BfD6", symbol: "WBTC", decimals: 8 },
   },
-  // Arbitrum Sepolia (testnet) — only WETH is verified.
+  // Arbitrum Sepolia (testnet) — WETH and the test USDC used by Uniswap and Aave there.
   421614: {
     WETH: { address: "0x980B62Da83eFf3D4576C647993b0c1D7faf17c73", symbol: "WETH", decimals: 18 },
+    USDC: { address: "0x75faf114eafb1BDbe2F0316DF893fd58CE46AA4d", symbol: "USDC", decimals: 6 },
   },
 };
 

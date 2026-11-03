@@ -79,6 +79,18 @@ const AGENT_FACTORY = "0x8D9e24022777173AD6336e00884b6C87c7EF054c" as const;
 const SMART_FACTORY = "0x230b7010529AB6977Dd8581B3eF018ef865BdEf1" as const;
 const ENTRY_POINT = "0x433709009B8330FDa32311DF1C2AFA402eD8D009" as const;
 
+/**
+ * Wallet V5 core — the same CREATE2 addresses on every supported network (Ethereum,
+ * Arbitrum One, Base, BNB Chain, Polygon and Arbitrum Sepolia). The SDK finds a
+ * wallet's generation by itself; these are for reference and for tooling.
+ */
+export const V5_ADDRESSES = {
+  agentFactory: "0xE36fb66c21C38536454C1a58fBC5EB1Cb455aD52",
+  smartWalletFactory: "0x2672951DC1E3f865BA6Fc98e5509dc4B23B260a2",
+  validatorRegistry: "0x7269334AE74DCE4e607eec36268383DD35f28350",
+  hookRegistry: "0xEaEaC7F6071f7F576Be2aD97898Dd0c0F51BE78A",
+} as const;
+
 export const NETWORKS: Record<number, BvccNetwork> = {
   42161: {
     chainId: 42161,
