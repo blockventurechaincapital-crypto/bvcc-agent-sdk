@@ -25,9 +25,10 @@ behave exactly as before; the client detects the generation of each wallet by it
 - **Batch adaptation (`adaptBatchForV5`).** Right before a batch is sent or simulated
   on a V5 wallet the client: drops the agent's own Permit2 grants (the owner grants
   them on V5); sends SwapRouter02 swaps (`exactInputSingle`, `exactOutputSingle`,
-  `exactInput`, `exactOutput`) through the Universal Router; and refuses, with a clear
-  message, what V5 does not allow agents (native ETH swaps and wrapping, Uniswap v3
-  liquidity, Aave `repayWithATokens`). The builders are unchanged.
+  `exactInput`, `exactOutput`) through the Universal Router; lets native-coin swaps
+  (wrapping) and Uniswap v3 liquidity through only where their validators are active
+  (see below); and refuses, with a clear message, Aave `repayWithATokens`. The builders
+  are unchanged.
 - **Router deadlines on chain time (`refreshStaleDeadlines`).** Deadlines are set from
   the computer's clock; when that clock is behind, the router reverted with
   `TransactionDeadlinePassed`. Before sending, the client now renews any Universal
