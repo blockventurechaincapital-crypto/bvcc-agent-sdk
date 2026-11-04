@@ -34,6 +34,7 @@ import { adaptBatchForV5, remainingUnder, v5Unlimited, withAgentFee } from "./v5
 import { refreshStaleDeadlines } from "./deadlines.js";
 import { describeRange, pricesToTicks, tickFromSqrtPrice, type RangeInfo } from "./lp/range.js";
 import { DEFAULT_SOURCE, encodeSourceTag, type SourceTagOptions } from "./sourceTag.js";
+import { SDK_UPDATE_TARGET, checkForUpdate, type UpdateCheckTarget } from "./updateCheck.js";
 import { AaveClient } from "./aave/client.js";
 import { getAaveAddresses } from "./aave/addresses.js";
 import { buildNativeToToken, buildTokenToNative } from "./nativeSwap.js";
@@ -135,6 +136,13 @@ export interface BvccAgentClientOptions {
    * transaction is mined (accrued LP fees, Arbitrum's L1 cost). Unused gas is not paid.
    */
   gasBufferBps?: number;
+  /**
+   * Check the npm registry for a newer version the first time `getAgentStatus` is
+   * called (one GET to the public registry, at most 2 s, never at construction). When
+   * one is out, `getAgentStatus` returns `updateAvailable`. Defaults to this SDK;
+   * `false` turns it off, as does the environment variable `BVCC_NO_UPDATE_CHECK=1`.
+   */
+  updateCheck?: UpdateCheckTarget | false;
 }
 
 const DEFAULT_GAS_BUFFER_BPS = 2_000;
@@ -203,6 +211,7 @@ export class BvccAgentClient {
   readonly walletClient: WalletClient;
   private readonly sourceTagHex: Hex | null;
   private readonly gasBufferBps: number;
+  private readonly updateTarget: UpdateCheckTarget | null;
 
   constructor(opts: BvccAgentClientOptions) {
     this.network =
@@ -214,6 +223,7 @@ export class BvccAgentClient {
     this.walletAddress = opts.walletAddress;
     this.sourceTagHex = opts.sourceTag === false ? null : encodeSourceTag(opts.sourceTag ?? DEFAULT_SOURCE);
     this.gasBufferBps = opts.gasBufferBps ?? DEFAULT_GAS_BUFFER_BPS;
+    this.updateTarget = opts.updateCheck === false ? null : (opts.updateCheck ?? SDK_UPDATE_TARGET);
 
     const transport = opts.transport ?? http(opts.rpcUrl ?? this.network.rpcUrl);
     const chain = {
@@ -1613,14 +1623,16 @@ export class BvccAgentClient {
 
   /** High-level snapshot of the agent's on-chain authorization. */
   async getAgentStatus(agent: Address = this.agentAddress): Promise<AgentStatus> {
-    const [p, walletPaused, walletVersion] = await Promise.all([
+    const [p, walletPaused, walletVersion, updateAvailable] = await Promise.all([
       this.getPermission(agent),
       this.isPaused(),
       this.walletVersion(),
+      this.updateTarget ? checkForUpdate(this.updateTarget) : Promise.resolve(null),
     ]);
     const isPaused = walletPaused || p.paused === true;
     const now = BigInt(Math.floor(Date.now() / 1000));
     return {
+      ...(updateAvailable ? { updateAvailable } : {}),
       walletVersion,
       walletAddress: this.walletAddress,
       agentAddress: agent,

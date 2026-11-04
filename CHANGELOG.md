@@ -4,6 +4,19 @@ All notable changes to `@bvcc/agent-sdk` are documented here. This project follo
 [Semantic Versioning](https://semver.org/). While on `0.x`, the public API may
 change between minor versions.
 
+## [0.3.1] — 2026-11-04
+
+### Added
+- **Update check.** The first time `getAgentStatus` runs, the client asks the public npm
+  registry for the latest `@bvcc/agent-sdk`. It is one GET per process, capped at 2
+  seconds, and creating the client does not trigger it. If a newer version is out, the
+  status includes `updateAvailable: { current, latest, command, changelogUrl }`; if the
+  registry is slow or down, the status is the same as before. The request carries
+  nothing about the user, the wallet or the agent. Turn it off with `updateCheck: false`
+  or `BVCC_NO_UPDATE_CHECK=1`. `updateCheck` can also point at another package: the MCP
+  uses this to check its own.
+- New exports: `checkForUpdate`, `isNewerVersion`, `updateCheckDisabled`.
+
 ## [0.3.0] — 2026-11-03
 
 Support for **wallet V5**, the new generation of the BVCC Agent Wallet. V2–V4 wallets

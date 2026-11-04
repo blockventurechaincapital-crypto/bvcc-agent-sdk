@@ -493,7 +493,9 @@ const getAgentStatus: Capability<Record<string, never>> = {
   summary: "Snapshot of the agent's on-chain authorization (active, expiry, whitelists).",
   description:
     "Reads whether the agent is authorized/expired/paused, its expiry, and the allowed tokens, " +
-    "protocols and recipients. Use to understand what the agent may do before acting.",
+    "protocols and recipients. Use to understand what the agent may do before acting. " +
+    "When a newer version of this tool is published it also returns updateAvailable " +
+    "(current, latest, command, changelogUrl): tell the user once.",
   params: z.object({}),
   invoke: async (client) => {
     const s = await client.getAgentStatus();

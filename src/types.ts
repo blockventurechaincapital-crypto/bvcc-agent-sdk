@@ -1,6 +1,7 @@
 import type { Address, Hex } from "viem";
 import type { ActionName } from "./results.js";
 import type { DecodedRevert } from "./errors.js";
+import type { UpdateAvailable } from "./updateCheck.js";
 
 /** A single call the wallet will perform (ERC-7579 / ERC-7821 batch item). */
 export interface Execution {
@@ -97,6 +98,8 @@ export interface AgentStatus {
   allowedTokens: readonly Address[];
   allowedProtocols: readonly Address[];
   allowedRecipients: readonly Address[];
+  /** Present when a newer version of the SDK (or the MCP) is published on npm. */
+  updateAvailable?: UpdateAvailable;
 }
 
 /** What the agent can currently do, derived from its on-chain permission. */

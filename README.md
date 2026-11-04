@@ -353,6 +353,14 @@ Anything V5 does not allow comes back as a failed result with a plain explanatio
   SDK or the BVCC MCP) and its version, so BVCC can tell which releases are in use and
   tie failures to a version. It carries nothing about you, your wallet or your agent,
   and the wallet ignores it. Turn it off with `new BvccAgentClient({ ..., sourceTag: false })`.
+- **Update check.** The first time you call `getAgentStatus`, the client asks the public
+  npm registry which version of `@bvcc/agent-sdk` is the latest. It is a single GET that
+  gives up after 2 seconds, and creating the client does not trigger it. When a newer
+  version is out, the status includes `updateAvailable: { current, latest, command,
+  changelogUrl }`. If the registry is slow or down, you get the status without that
+  field. The request carries nothing about you, your wallet or your agent, though npm
+  does see your IP address, the same as with any `npm install`. To turn it off, pass
+  `updateCheck: false` to `new BvccAgentClient({ ... })` or set `BVCC_NO_UPDATE_CHECK=1`.
 
 ## For developers
 

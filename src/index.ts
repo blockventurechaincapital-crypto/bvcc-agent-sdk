@@ -48,6 +48,14 @@ export { refreshStaleDeadlines } from "./deadlines.js";
 export { encodeSourceTag, decodeSourceTag, SOURCE_TAG_MAGIC, DEFAULT_SOURCE } from "./sourceTag.js";
 export type { SourceTagOptions, SourceTool } from "./sourceTag.js";
 export { SDK_VERSION } from "./version.js";
+export {
+  checkForUpdate,
+  isNewerVersion,
+  updateCheckDisabled,
+  resetUpdateCheck,
+  SDK_UPDATE_TARGET,
+} from "./updateCheck.js";
+export type { UpdateCheckTarget, UpdateAvailable, CheckForUpdateOptions, FetchLike } from "./updateCheck.js";
 
 // Native ETH swaps (own batches via SwapRouter02 + WETH)
 export {
