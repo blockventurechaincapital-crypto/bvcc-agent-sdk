@@ -169,6 +169,7 @@ export type { DecodedRevert } from "./errors.js";
 
 // Structured results
 export { ok, fail } from "./results.js";
+export { SubmissionError } from "./submission.js";
 export type { ActionResult, ActionSuccess, ActionFailure, ActionName, ActionContext } from "./results.js";
 
 // Token registry

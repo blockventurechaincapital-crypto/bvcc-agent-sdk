@@ -16,6 +16,7 @@
 import { encodeFunctionData, type Address } from "viem";
 
 import { erc20Abi, swapRouter02Abi } from "./abi.js";
+import type { DecodedRevert } from "./errors.js";
 import type { Execution } from "./types.js";
 
 /** BVCC agent fee, in basis points, charged on Case-3 balance increases. */
@@ -39,6 +40,60 @@ const approve = (token: Address, spender: Address, amount: bigint): Execution =>
   value: 0n,
   callData: encodeFunctionData({ abi: erc20Abi, functionName: "approve", args: [spender, amount] }),
 });
+
+const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
+
+/** Same address, case-insensitive. The zero address (native ETH in v4 pools) counts as WETH. */
+export function isSameSwapToken(a: Address, b: Address, weth?: Address): boolean {
+  const norm = (x: Address) => {
+    const l = x.toLowerCase();
+    return weth && l === ZERO_ADDRESS ? weth.toLowerCase() : l;
+  };
+  return norm(a) === norm(b);
+}
+
+/**
+ * A single-hop swap whose input and output are the same token (ETH counted as WETH).
+ * No pool for it exists, so the transaction would only revert and burn gas.
+ */
+export class SameTokenSwapError extends Error {
+  readonly bvccDecoded: DecodedRevert;
+  constructor() {
+    super("The swap's input and output are the same token (ETH counts as WETH): there is no pool for that.");
+    this.name = "SameTokenSwapError";
+    this.bvccDecoded = {
+      errorName: "SameTokenSwap",
+      humanMessage: this.message,
+      suggestedAction:
+        "To turn ETH into WETH use wrapNative; to turn WETH into ETH use unwrapNative. " +
+        "For a swap, pick two different tokens.",
+      rawError: "tokenIn == tokenOut",
+      retryable: false,
+    };
+  }
+}
+
+/** `[WETH.deposit{value: amount}]` — native ETH in, the same amount of WETH out. */
+export function buildWrapNative(p: { weth: Address; amount: bigint }): Execution[] {
+  return [
+    {
+      target: p.weth,
+      value: p.amount,
+      callData: encodeFunctionData({ abi: wethAbi, functionName: "deposit", args: [] }),
+    },
+  ];
+}
+
+/** `[WETH.withdraw(amount)]` — WETH in, the same amount of native ETH out. */
+export function buildUnwrapNative(p: { weth: Address; amount: bigint }): Execution[] {
+  return [
+    {
+      target: p.weth,
+      value: 0n,
+      callData: encodeFunctionData({ abi: wethAbi, functionName: "withdraw", args: [p.amount] }),
+    },
+  ];
+}
 
 /** Subtract the BVCC fee from a gross amount the wallet is about to receive. */
 export function netOfFee(gross: bigint): bigint {
@@ -77,6 +132,8 @@ export interface TokenToNativeParams {
  * and the unwrap then takes exactly `amountOut`.
  */
 export function buildTokenToNative(p: TokenToNativeParams): Execution[] {
+  // WETH → ETH is an unwrap, not a swap: there is no WETH/WETH pool.
+  if (isSameSwapToken(p.tokenIn, p.weth)) return buildUnwrapNative({ weth: p.weth, amount: p.amountOut });
   const gross = p.feeOnTop ? p.amountOut : grossForNet(p.amountOut);
   const swapData = encodeFunctionData({
     abi: swapRouter02Abi,
@@ -125,6 +182,8 @@ export interface NativeToTokenParams {
  * not to the ETH sent, or the batch reverts for insufficient balance.
  */
 export function buildNativeToToken(p: NativeToTokenParams): Execution[] {
+  // ETH → WETH is a wrap, not a swap: there is no WETH/WETH pool.
+  if (isSameSwapToken(p.tokenOut, p.weth)) return buildWrapNative({ weth: p.weth, amount: p.amountIn });
   const swappable = p.feeOnTop ? p.amountIn : netOfFee(p.amountIn);
   const swapData = encodeFunctionData({
     abi: swapRouter02Abi,

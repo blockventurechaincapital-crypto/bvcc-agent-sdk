@@ -4,6 +4,47 @@ All notable changes to `@bvcc/agent-sdk` are documented here. This project follo
 [Semantic Versioning](https://semver.org/). While on `0.x`, the public API may
 change between minor versions.
 
+## [0.4.0] — 2026-11-08
+
+### Fixed
+- **Wrapping ETH into WETH.** `swapFromNative` with WETH as `tokenOut` built a wrap, then
+  an approve, then a swap from WETH to WETH. That pool does not exist, so the whole batch
+  reverted and the gas was lost. It now sends only the wrap. In the same way,
+  `swapToNative` with WETH as `tokenIn` now sends only the unwrap. Code that already
+  calls them this way works without changes.
+
+### Added
+- **`wrapNative(amount)` / `unwrapNative(amount)`**, with `dryRunWrapNative` and
+  `dryRunUnwrapNative` and the pure builders `buildWrapNative` / `buildUnwrapNative`.
+  One call to WETH, one to one. WETH has to be in `allowedProtocols`; on wallet V5 it
+  also needs `getCapabilities().canWrapNative`. The amount of a wrap counts against the
+  agent's native (ETH) limits. Fees: before V5, a wrap keeps the amount minus 0.15% as
+  WETH and an unwrap is free; on V5 the 0.15% is paid on top, in ETH for a wrap and in
+  WETH for an unwrap.
+- **Sending never does an operation twice.** Before, a send that failed after the node
+  had already accepted it (a timeout, a dropped connection) was reported as a failure,
+  and repeating it ran it twice. Two operations sent back to back could also collide on
+  the nonce and be shown as an unexplained revert. Now:
+  - the transaction is signed locally, so its hash is known before it is sent, and a send
+    that throws is looked up on-chain before it is called a failure;
+  - `run()` and every structured write wait for confirmation (`confirmTimeoutMs`, default
+    2 minutes) and return the `txHash` of a confirmed transaction;
+  - an operation that may be on-chain comes back as `NotYetConfirmed` or
+    `SubmissionUnknown`, with its `txHash` and `retryable: false`: check it before doing
+    anything else;
+  - operations from one client go out one at a time, each after the previous one is
+    confirmed, and the nonce comes from the confirmed count, so a repeat sent while the
+    first is pending cannot also be included;
+  - nothing is re-sent automatically. `SubmissionError` is exported.
+- **Wallet V5: a v4 swap paying out native ETH (`nativeOut`) is refused before any gas**,
+  with the way round (swap to WETH, then `unwrapNative`). Before, it reached the chain and
+  came back as a generic validation failure.
+- **A single-hop swap from a token to itself is refused** before any gas, with
+  `errorName: "SameTokenSwap"`, `retryable: false` and a pointer to wrap or unwrap. ETH
+  counts as WETH. This applies to `swapExactInputV3`, `swapV4ExactIn`, their dry-runs and
+  `buildSwapPlan`. A multi-hop route that comes back to its start (arbitrage) is still
+  allowed.
+
 ## [0.3.1] — 2026-11-04
 
 ### Added

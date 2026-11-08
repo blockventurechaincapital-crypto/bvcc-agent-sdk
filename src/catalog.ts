@@ -29,7 +29,7 @@ import { z } from "zod";
 import { erc20Abi } from "./abi.js";
 import type { BvccAgentClient } from "./client.js";
 import { resolveToken, NATIVE_TOKEN } from "./tokens.js";
-import { netOfFee } from "./nativeSwap.js";
+import { netOfFee, isSameSwapToken } from "./nativeSwap.js";
 import { PERMIT2 } from "./universalRouter.js";
 import { listGuides as guideList, getGuide as guideText } from "./guides.js";
 
@@ -136,6 +136,12 @@ function requireSlippageProtection(amountOutMinimumRaw: bigint): void {
  * on-chain quote → else refuse. Returns the resolved tokenOut address and the raw
  * minimum to pass to the swap.
  */
+/** True when a single-hop swap would go from a token to itself (ETH counted as WETH). */
+function isSameTokenSwap(client: BvccAgentClient, tokenIn: Address, tokenOut: string): boolean {
+  const out = resolveToken(client.network.chainId, tokenOut).address;
+  return isSameSwapToken(tokenIn, out, client.network.weth);
+}
+
 async function deriveMinOut(
   client: BvccAgentClient,
   protocol: "v3" | "v4",
@@ -420,6 +426,11 @@ const swapV3: Capability<SwapArgs> = {
   params: swapParams,
   invoke: async (client, p) => {
     const inUnits = await toBaseUnits(client, p.tokenIn, p.amountIn);
+    if (isSameTokenSwap(client, inUnits.address, p.tokenOut)) {
+      // No pool exists: the client refuses it with a clear, non-retryable message.
+      const out = resolveToken(client.network.chainId, p.tokenOut).address;
+      return client.swapExactInputV3({ tokenIn: inUnits.address, tokenOut: out, amountIn: inUnits.raw, amountOutMinimum: 1n, fee: p.fee });
+    }
     const { outAddress, minRaw } = await deriveMinOut(client, "v3", {
       ...p,
       amountInRaw: inUnits.raw,
@@ -467,6 +478,21 @@ const swapV4: Capability<SwapV4Args> = {
     // Native output prices and settles on the native (address(0)) pool, not WETH —
     // quote and floor come from that pool so slippage protection matches the swap.
     const tokenOut = p.nativeOut ? NATIVE_TOKEN : p.tokenOut;
+    if (p.nativeOut && (await client.walletVersion()) === "v5") {
+      // Refused by the client before any quote or gas, with the way round.
+      return client.swapV4ExactIn({
+        tokenIn: inUnits.address, tokenOut: NATIVE_TOKEN, amountIn: inUnits.raw, amountOutMinimum: 1n,
+        fee: p.fee, tickSpacing: p.tickSpacing, nativeOut: true,
+      });
+    }
+    if (isSameTokenSwap(client, inUnits.address, tokenOut)) {
+      // No pool exists: the client refuses it with a clear, non-retryable message.
+      const out = resolveToken(client.network.chainId, tokenOut).address;
+      return client.swapV4ExactIn({
+        tokenIn: inUnits.address, tokenOut: out, amountIn: inUnits.raw, amountOutMinimum: 1n,
+        fee: p.fee, tickSpacing: p.tickSpacing, nativeOut: p.nativeOut,
+      });
+    }
     const { outAddress, minRaw } = await deriveMinOut(client, "v4", {
       ...p,
       tokenOut,
@@ -797,7 +823,8 @@ const swapToNative: Capability<{
     "`amountInMaximum` is your price protection — it caps what the swap may spend. " +
     "Note the per-token per-tx limit is consumed by that cap, not by what is actually spent, " +
     "so the agent needs headroom of at least `amountInMaximum`. " +
-    "Requires WETH in allowedProtocols and `tokenIn` in allowedTokens.",
+    "Requires WETH in allowedProtocols and `tokenIn` in allowedTokens. " +
+    "With tokenIn = WETH this is an unwrap (unwrapNative): only `amountOut` is used.",
   params: z.object({
     tokenIn: zToken,
     amountOut: zAmount.describe("Exact native ETH to receive, e.g. '0.01'"),
@@ -805,6 +832,11 @@ const swapToNative: Capability<{
     fee: z.number().int().optional().describe("Pool fee tier. Default 3000."),
   }),
   invoke: async (client, p) => {
+    const weth = client.network.weth;
+    if (weth && isSameSwapToken(resolveToken(client.network.chainId, p.tokenIn).address, weth)) {
+      // WETH → ETH is an unwrap, not a swap.
+      return client.unwrapNative(parseEther(p.amountOut));
+    }
     const inUnits = await toBaseUnits(client, p.tokenIn, p.amountInMaximum);
     if (inUnits.raw <= 0n) {
       throw new Error("amountInMaximum must be greater than 0 — it is the swap's price protection.");
@@ -834,7 +866,8 @@ const swapFromNative: Capability<{
     "Atomic batch: wrap ETH to WETH → approve → swap to `tokenOut` (recipient = wallet). " +
     "The 0.15% agent fee applies. The swap is sized to the post-fee WETH automatically. " +
     "Requires WETH in allowedProtocols and allowedTokens. " +
-    "Pass `amountOutMinimum` (exact) or `slippageBps`; one is required.",
+    "Pass `amountOutMinimum` (exact) or `slippageBps`; one is required. " +
+    "With tokenOut = WETH this is a wrap (wrapNative): no swap, no minimum needed.",
   params: z.object({
     tokenOut: zToken,
     amountIn: zAmount.describe("Native ETH to spend, e.g. '0.01'"),
@@ -855,6 +888,10 @@ const swapFromNative: Capability<{
     const weth = client.network.weth;
     if (!weth) throw new Error(`No WETH address known for ${client.network.name}.`);
     const amountInRaw = parseEther(p.amountIn);
+    if (isSameSwapToken(resolveToken(client.network.chainId, p.tokenOut).address, weth)) {
+      // ETH → WETH is a wrap, not a swap.
+      return client.wrapNative(amountInRaw);
+    }
     // Quote against the amount that actually reaches the pool: the wrap's 0.15%
     // fee is taken first, so quoting the gross ETH would set the floor too high.
     const { minRaw } = await deriveMinOut(client, "v3", {
@@ -873,6 +910,59 @@ const swapFromNative: Capability<{
       fee: p.fee,
     });
   },
+};
+
+// ---------------------------------------------------------------------------
+// Wrap / unwrap the native coin (WETH, WBNB, WPOL) — no swap involved
+// ---------------------------------------------------------------------------
+
+const WRAP_NOTES =
+  "Requires WETH in allowedProtocols. Wallet V5: only where getCapabilities reports canWrapNative. ";
+
+const wrapNative: Capability<{ amount: string }> = {
+  id: "wrapNative",
+  kind: "write",
+  title: "Wrap native ETH into WETH",
+  summary: "Turn native ETH into WETH, one to one (the 0.15% agent fee applies).",
+  description:
+    "One call, WETH.deposit — use this, not a swap, to go from ETH to WETH. " + WRAP_NOTES +
+    "The amount counts against the agent's native (ETH) limits. Fee: before V5 the wallet keeps " +
+    "the amount minus 0.15% as WETH; on V5 it gets the whole amount and the 0.15% is paid on top in ETH.",
+  params: z.object({ amount: zAmount.describe("Native ETH to wrap, e.g. '0.01'") }),
+  invoke: async (client, { amount }) => client.wrapNative(parseEther(amount)),
+};
+
+const unwrapNative: Capability<{ amount: string }> = {
+  id: "unwrapNative",
+  kind: "write",
+  title: "Unwrap WETH into native ETH",
+  summary: "Turn WETH back into native ETH, one to one.",
+  description:
+    "One call, WETH.withdraw — use this, not a swap, to go from WETH to ETH. " + WRAP_NOTES +
+    "Fee: none before V5; on V5 the 0.15% is paid on top in WETH and the amount counts against " +
+    "the agent's WETH limits.",
+  params: z.object({ amount: zAmount.describe("WETH to unwrap, e.g. '0.01'") }),
+  invoke: async (client, { amount }) => client.unwrapNative(parseEther(amount)),
+};
+
+const dryRunWrapNative: Capability<{ amount: string }> = {
+  id: "dryRunWrapNative",
+  kind: "simulate",
+  title: "Dry-run wrap native ETH",
+  summary: "Simulate wrapping ETH into WETH (gas estimate + revert reason) without sending.",
+  description: "Same input as wrapNative, but only simulates — estimates gas and explains any revert.",
+  params: z.object({ amount: zAmount }),
+  invoke: async (client, { amount }) => enrichDryRun(client, await client.dryRunWrapNative(parseEther(amount))),
+};
+
+const dryRunUnwrapNative: Capability<{ amount: string }> = {
+  id: "dryRunUnwrapNative",
+  kind: "simulate",
+  title: "Dry-run unwrap WETH",
+  summary: "Simulate unwrapping WETH into ETH (gas estimate + revert reason) without sending.",
+  description: "Same input as unwrapNative, but only simulates — estimates gas and explains any revert.",
+  params: z.object({ amount: zAmount }),
+  invoke: async (client, { amount }) => enrichDryRun(client, await client.dryRunUnwrapNative(parseEther(amount))),
 };
 
 // ---------------------------------------------------------------------------
@@ -1674,6 +1764,8 @@ export const CATALOG: readonly Capability<never>[] = [
   dryRunSendToken,
   dryRunSwapV3,
   dryRunSwapV4,
+  dryRunWrapNative,
+  dryRunUnwrapNative,
   // Aave reads + simulations
   getAavePositions,
   getAaveMarket,
@@ -1699,6 +1791,8 @@ export const CATALOG: readonly Capability<never>[] = [
   swapV4,
   swapToNative,
   swapFromNative,
+  wrapNative,
+  unwrapNative,
   // Aave writes
   aaveSupply,
   aaveWithdraw,

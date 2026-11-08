@@ -11,6 +11,8 @@ export type ActionName =
   | "swapUniversalRouter"
   | "swapToNative"
   | "swapFromNative"
+  | "wrapNative"
+  | "unwrapNative"
   | "addLiquidityV3"
   | "removeLiquidityV3"
   | "collectFeesV3"
@@ -51,6 +53,11 @@ export interface ActionFailure extends ActionContext {
   rawError: string;
   /** false: the same call will fail again — do not repeat it with the same parameters. */
   retryable: boolean;
+  /**
+   * Set when the operation was sent and may be on-chain (`NotYetConfirmed`,
+   * `SubmissionUnknown`) or reverted on-chain. Check it before doing anything else.
+   */
+  txHash?: Hex;
 }
 
 export type ActionResult = ActionSuccess | ActionFailure;
@@ -59,8 +66,9 @@ export function ok(action: ActionName, txHash: Hex, ctx: ActionContext): ActionS
   return { ok: true, action, txHash, ...ctx };
 }
 
-export function fail(action: ActionName, decoded: DecodedRevert, ctx: ActionContext): ActionFailure {
+export function fail(action: ActionName, decoded: DecodedRevert, ctx: ActionContext, txHash?: Hex): ActionFailure {
   return {
+    ...(txHash ? { txHash } : {}),
     ok: false,
     action,
     errorName: decoded.errorName,

@@ -176,6 +176,20 @@ await agent.swapFromNative({
 });
 ```
 
+To go between ETH and WETH, wrap or unwrap. It is not a swap, and there is no pool for it:
+
+```ts
+await agent.wrapNative(parseEther("0.01"));   // ETH → WETH, one to one
+await agent.unwrapNative(parseEther("0.01")); // WETH → ETH
+```
+
+`swapFromNative` with WETH as `tokenOut`, or `swapToNative` with WETH as `tokenIn`, does
+the same wrap or unwrap. A single-hop swap from a token to itself is refused before any
+gas, with `retryable: false`. WETH has to be in `allowedProtocols`; on wallet V5 it also
+needs `getCapabilities().canWrapNative`. Fees: before V5, a wrap keeps the amount minus
+0.15% as WETH and an unwrap is free; on V5 the 0.15% is paid on top, in ETH for a wrap and
+in WETH for an unwrap.
+
 ### Provide liquidity on Uniswap (v3 & v4)
 
 Open a position, collect its fees, and close it. The position NFT is minted **to
@@ -340,6 +354,10 @@ Anything V5 does not allow comes back as a failed result with a plain explanatio
 
 ## Good to know
 
+- **Never twice.** A write is reported as done only once it is confirmed. If it may be
+  on-chain but is not confirmed yet, the result is `NotYetConfirmed` or
+  `SubmissionUnknown`, with its `txHash` and `retryable: false`: check that hash before
+  repeating anything. Operations from one client go out one at a time.
 - **Retry or not.** Every failed result carries `retryable`. When it is `false` the same
   call will fail again (a budget is used up, a permission is missing, the balance is
   short): change the input or ask the owner instead of repeating it.

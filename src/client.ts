@@ -7,6 +7,7 @@ import {
   formatEther,
   formatUnits,
   http,
+  keccak256,
   slice,
   type Account,
   type Address,
@@ -30,14 +31,21 @@ import {
   v4PositionManagerReadAbi,
 } from "./abi.js";
 import { detectWalletVersion, getActiveValidator, getPolicy, SELECTORS, type WalletVersion } from "./policy.js";
-import { adaptBatchForV5, remainingUnder, v5Unlimited, withAgentFee } from "./v5.js";
+import { adaptBatchForV5, remainingUnder, v5Unlimited, withAgentFee, V5UnsupportedError } from "./v5.js";
 import { refreshStaleDeadlines } from "./deadlines.js";
 import { describeRange, pricesToTicks, tickFromSqrtPrice, type RangeInfo } from "./lp/range.js";
 import { DEFAULT_SOURCE, encodeSourceTag, type SourceTagOptions } from "./sourceTag.js";
 import { SDK_UPDATE_TARGET, checkForUpdate, type UpdateCheckTarget } from "./updateCheck.js";
 import { AaveClient } from "./aave/client.js";
 import { getAaveAddresses } from "./aave/addresses.js";
-import { buildNativeToToken, buildTokenToNative } from "./nativeSwap.js";
+import {
+  buildNativeToToken,
+  buildTokenToNative,
+  buildWrapNative,
+  buildUnwrapNative,
+  isSameSwapToken,
+  SameTokenSwapError,
+} from "./nativeSwap.js";
 import { getNetwork, type BvccNetwork } from "./networks.js";
 import {
   buildUniversalRouterSwap,
@@ -76,6 +84,14 @@ import {
   type V4PoolKey,
 } from "./lp/v4.js";
 import { decodeRevert, type DecodedRevert } from "./errors.js";
+import {
+  SubmissionError,
+  isNonceTooLow,
+  nonceTaken,
+  notYetConfirmed,
+  previousPending,
+  submissionUnknown,
+} from "./submission.js";
 import { resolveToken } from "./tokens.js";
 import {
   applySlippage,
@@ -143,6 +159,12 @@ export interface BvccAgentClientOptions {
    * `false` turns it off, as does the environment variable `BVCC_NO_UPDATE_CHECK=1`.
    */
   updateCheck?: UpdateCheckTarget | false;
+  /**
+   * How long `run()` (and every structured write) waits for the transaction to be confirmed,
+   * in milliseconds. Default 120000. Past it the result is `NotYetConfirmed` with the hash:
+   * the operation may still go through, so it is not reported as a failure.
+   */
+  confirmTimeoutMs?: number;
 }
 
 const DEFAULT_GAS_BUFFER_BPS = 2_000;
@@ -212,6 +234,15 @@ export class BvccAgentClient {
   private readonly sourceTagHex: Hex | null;
   private readonly gasBufferBps: number;
   private readonly updateTarget: UpdateCheckTarget | null;
+  private readonly confirmTimeoutMs: number;
+  /** Operations from this client go out one at a time. */
+  private sendQueue: Promise<unknown> = Promise.resolve();
+  /** The last transaction sent and not yet seen confirmed. The next send waits for it. */
+  private lastSent: Hex | null = null;
+  /** Calldata of the last batch sent, to replay a revert and read its reason. */
+  private lastCalldata: Hex | undefined;
+  /** How hard to look for a transaction whose send threw (about 10 s in total). */
+  private lookupPolicy = { tries: 5, pauseMs: 2_000 };
 
   constructor(opts: BvccAgentClientOptions) {
     this.network =
@@ -224,6 +255,7 @@ export class BvccAgentClient {
     this.sourceTagHex = opts.sourceTag === false ? null : encodeSourceTag(opts.sourceTag ?? DEFAULT_SOURCE);
     this.gasBufferBps = opts.gasBufferBps ?? DEFAULT_GAS_BUFFER_BPS;
     this.updateTarget = opts.updateCheck === false ? null : (opts.updateCheck ?? SDK_UPDATE_TARGET);
+    this.confirmTimeoutMs = opts.confirmTimeoutMs ?? 120_000;
 
     const transport = opts.transport ?? http(opts.rpcUrl ?? this.network.rpcUrl);
     const chain = {
@@ -361,6 +393,7 @@ export class BvccAgentClient {
     fee?: number;
     router?: Address;
   }): Execution[] {
+    if (isSameSwapToken(params.tokenIn, params.tokenOut, this.network.weth)) throw new SameTokenSwapError();
     const router = params.router ?? this.network.swapRouter02;
     if (!router) {
       throw new Error(
@@ -435,6 +468,11 @@ export class BvccAgentClient {
   buildSwapV4ExactIn(
     params: Omit<V4SwapExactInParams, "router" | "recipient"> & { router?: Address },
   ): Execution[] {
+    // Single hop only: a multi-hop path that comes back to its start (arbitrage) is legitimate.
+    if (!params.path?.length) {
+      const out = params.nativeOut ? "0x0000000000000000000000000000000000000000" : params.tokenOut;
+      if (isSameSwapToken(params.tokenIn, out as Address, this.network.weth)) throw new SameTokenSwapError();
+    }
     const router = params.router ?? this.network.universalRouter;
     if (!router) {
       throw new Error(
@@ -448,7 +486,21 @@ export class BvccAgentClient {
   async swapV4ExactIn(
     params: Parameters<BvccAgentClient["buildSwapV4ExactIn"]>[0],
   ): Promise<ActionResult> {
-    return this.run("swapV4", this.buildSwapV4ExactIn(params));
+    const refused = await this.v5NativeOutRefusal(params.nativeOut);
+    if (refused) return fail("swapV4", refused.bvccDecoded, this.ctx());
+    return this.runBuilt("swapV4", () => this.buildSwapV4ExactIn(params));
+  }
+
+  /**
+   * Wallet V5: a v4 swap that pays out native ETH is refused by the wallet's router
+   * validator (swaps run between ERC-20 tokens). Say so before any gas, with the way round.
+   */
+  private async v5NativeOutRefusal(nativeOut?: boolean): Promise<V5UnsupportedError | null> {
+    if (!nativeOut || (await this.walletVersion()) !== "v5") return null;
+    return new V5UnsupportedError(
+      "A Uniswap v4 swap that pays out native ETH is not available to agents on wallet V5: swaps run between ERC-20 tokens.",
+      "Swap to WETH instead (swapV4 without nativeOut) and then use unwrapNative, or use swapToNative where getCapabilities reports canWrapNative.",
+    );
   }
 
   // ------------------------------------------------------------------
@@ -485,6 +537,8 @@ export class BvccAgentClient {
 
   /** Submit a token → ETH swap. Structured result. */
   async swapToNative(params: Parameters<BvccAgentClient["buildSwapToNative"]>[0]): Promise<ActionResult> {
+    // WETH → ETH is an unwrap: no swap, no pool.
+    if (this.network.weth && isSameSwapToken(params.tokenIn, this.network.weth)) return this.unwrapNative(params.amountOut);
     const feeOnTop = params.feeOnTop ?? (await this.walletVersion()) === "v5";
     return this.run("swapToNative", this.buildSwapToNative({ ...params, feeOnTop }));
   }
@@ -510,8 +564,68 @@ export class BvccAgentClient {
 
   /** Submit an ETH → token swap (0.15% agent fee). Structured result. */
   async swapFromNative(params: Parameters<BvccAgentClient["buildSwapFromNative"]>[0]): Promise<ActionResult> {
+    // ETH → WETH is a wrap: no swap, no pool.
+    if (this.network.weth && isSameSwapToken(params.tokenOut, this.network.weth)) return this.wrapNative(params.amountIn);
     const feeOnTop = params.feeOnTop ?? (await this.walletVersion()) === "v5";
     return this.run("swapFromNative", this.buildSwapFromNative({ ...params, feeOnTop }));
+  }
+
+  // ------------------------------------------------------------------
+  // Wrap / unwrap the native coin (WETH, WBNB, WPOL)
+  // ------------------------------------------------------------------
+
+  private wethOrThrow(): Address {
+    if (!this.network.weth) throw new Error(`No wrapped native token known for ${this.network.name}.`);
+    return this.network.weth;
+  }
+
+  /**
+   * Native ETH → WETH: `[WETH.deposit{value: amount}]`. WETH must be in
+   * `allowedProtocols`; the amount counts against the agent's native (ETH) limits.
+   * Fee: before V5 the wallet keeps `amount` minus 0.15% of WETH; on V5 it gets all of
+   * `amount` and the 0.15% is paid on top in ETH.
+   */
+  buildWrapNative(amount: bigint): Execution[] {
+    return buildWrapNative({ weth: this.wethOrThrow(), amount });
+  }
+
+  /**
+   * WETH → native ETH: `[WETH.withdraw(amount)]`. WETH must be in `allowedProtocols`.
+   * Fee: none before V5; on V5 the 0.15% is paid on top in WETH and the amount counts
+   * against the agent's WETH limits.
+   */
+  buildUnwrapNative(amount: bigint): Execution[] {
+    return buildUnwrapNative({ weth: this.wethOrThrow(), amount });
+  }
+
+  /** Wrap native ETH into WETH. Structured result. */
+  async wrapNative(amount: bigint): Promise<ActionResult> {
+    const short = await this.feeRoomShortfall("native", amount);
+    if (short) return fail("wrapNative", short, this.ctx());
+    return this.runBuilt("wrapNative", () => this.buildWrapNative(amount));
+  }
+
+  /** Unwrap WETH into native ETH. Structured result. */
+  async unwrapNative(amount: bigint): Promise<ActionResult> {
+    const weth = this.network.weth;
+    const short = weth ? await this.feeRoomShortfall(weth, amount) : null;
+    if (short) return fail("unwrapNative", short, this.ctx());
+    return this.runBuilt("unwrapNative", () => this.buildUnwrapNative(amount));
+  }
+
+  /** Simulate {@link wrapNative} without sending. */
+  async dryRunWrapNative(amount: bigint): Promise<DryRunResult> {
+    const short = await this.feeRoomShortfall("native", amount);
+    if (short) return { ok: false, action: "wrapNative", estimatedGas: null, estimatedNetworkFeeWei: null, preview: [], failure: short };
+    return this.dryRunBuilt("wrapNative", () => this.buildWrapNative(amount));
+  }
+
+  /** Simulate {@link unwrapNative} without sending. */
+  async dryRunUnwrapNative(amount: bigint): Promise<DryRunResult> {
+    const weth = this.network.weth;
+    const short = weth ? await this.feeRoomShortfall(weth, amount) : null;
+    if (short) return { ok: false, action: "unwrapNative", estimatedGas: null, estimatedNetworkFeeWei: null, preview: [], failure: short };
+    return this.dryRunBuilt("unwrapNative", () => this.buildUnwrapNative(amount));
   }
 
   /** ABI-encode a batch into `executionData` for `executeAsAgent`. */
@@ -535,8 +649,28 @@ export class BvccAgentClient {
   // Execution (broadcast)
   // ------------------------------------------------------------------
 
-  /** Submit a batch of executions via `executeAsAgent`. Returns the tx hash. */
-  async execute(executions: Execution[]): Promise<Hex> {
+  /**
+   * Submit a batch of executions via `executeAsAgent`. Returns the tx hash once the node
+   * has it; does not wait for confirmation (see {@link run} for that).
+   *
+   * Never sends the same operation twice: the transaction is signed locally so its hash is
+   * known before sending, a send that throws is looked up on-chain before it is called a
+   * failure, and an operation that may be on-chain throws a {@link SubmissionError} carrying
+   * the hash. Sends from one client go out one at a time.
+   */
+  execute(executions: Execution[]): Promise<Hex> {
+    return this.queued(() => this.executeNow(executions));
+  }
+
+  /** Run `fn` after every earlier send of this client has finished. */
+  private queued<T>(fn: () => Promise<T>): Promise<T> {
+    const next = this.sendQueue.then(fn, fn);
+    this.sendQueue = next.catch(() => undefined);
+    return next;
+  }
+
+  private async executeNow(executions: Execution[]): Promise<Hex> {
+    await this.waitForPrevious();
     const batch = await this.prepareBatch(executions);
     const data = this.agentCalldata(batch);
     // Estimate first: a batch that would revert throws here and is never sent. Then
@@ -548,13 +682,118 @@ export class BvccAgentClient {
       data,
     });
     const gas = (estimated * BigInt(10_000 + this.gasBufferBps)) / 10_000n;
-    return this.walletClient.sendTransaction({
+    this.lastCalldata = data;
+    return this.broadcast(data, gas);
+  }
+
+  /** The previous transaction of this client must be confirmed before the next one is sent. */
+  private async waitForPrevious(): Promise<void> {
+    const prev = this.lastSent;
+    if (!prev) return;
+    try {
+      await this.publicClient.waitForTransactionReceipt({ hash: prev, timeout: this.confirmTimeoutMs });
+      this.lastSent = null;
+    } catch {
+      throw new SubmissionError(previousPending(prev));
+    }
+  }
+
+  /**
+   * Sign, send, and on a send error find out whether the transaction is on-chain anyway.
+   * The nonce is the confirmed count: a repeat sent while an earlier copy is pending gets
+   * the same nonce, so only one of the two can be included.
+   */
+  private async broadcast(data: Hex, gas: bigint): Promise<Hex> {
+    const nonce = await this.publicClient.getTransactionCount({ address: this.account.address, blockTag: "latest" });
+    if (typeof this.account.signTransaction !== "function") {
+      // A remote (JSON-RPC) signer: the hash is only known once the node returns it.
+      const hash = await this.walletClient.sendTransaction({
+        account: this.account,
+        chain: this.walletClient.chain,
+        to: this.walletAddress,
+        data,
+        gas,
+        nonce,
+      });
+      this.lastSent = hash;
+      return hash;
+    }
+    const request = await this.walletClient.prepareTransactionRequest({
       account: this.account,
       chain: this.walletClient.chain,
       to: this.walletAddress,
       data,
       gas,
+      nonce,
     });
+    const serialized = await this.walletClient.signTransaction(request as never);
+    const hash = keccak256(serialized);
+    try {
+      await this.publicClient.sendRawTransaction({ serializedTransaction: serialized });
+    } catch (e) {
+      if (await this.isKnownOnChain(hash)) {
+        this.lastSent = hash;
+        return hash;
+      }
+      // The nonce went to another transaction: this one can never be included.
+      if (isNonceTooLow(e)) throw new SubmissionError(nonceTaken());
+      this.lastSent = hash;
+      throw new SubmissionError(submissionUnknown(hash), hash);
+    }
+    this.lastSent = hash;
+    return hash;
+  }
+
+  /** Whether the node knows the transaction (pending or mined), asked a few times. */
+  private async isKnownOnChain(hash: Hex): Promise<boolean> {
+    const { tries, pauseMs } = this.lookupPolicy;
+    for (let i = 0; i < tries; i++) {
+      try {
+        if (await this.publicClient.getTransaction({ hash })) return true;
+      } catch {
+        /* not found yet */
+      }
+      if (i < tries - 1) await new Promise((r) => setTimeout(r, pauseMs));
+    }
+    return false;
+  }
+
+  /**
+   * Wait for a sent transaction and turn the receipt into a result. A reverted one is a
+   * failure with its reason; one not confirmed in time is `NotYetConfirmed`, never a plain
+   * failure, because it may still go through.
+   */
+  private async confirm(action: ActionName, hash: Hex, data?: Hex): Promise<ActionResult> {
+    let receipt;
+    try {
+      receipt = await this.publicClient.waitForTransactionReceipt({ hash, timeout: this.confirmTimeoutMs });
+    } catch {
+      return fail(action, notYetConfirmed(hash), this.ctx(), hash);
+    }
+    this.lastSent = null;
+    if (receipt.status === "success") return ok(action, hash, this.ctx());
+    // Reverted on-chain: nothing ran. Replay it at the block before to read the reason.
+    let decoded: DecodedRevert = {
+      errorName: null,
+      humanMessage: "The transaction reverted on-chain; nothing was executed.",
+      suggestedAction: "Check the balances and limits, then decide whether to try again.",
+      rawError: "reverted",
+      retryable: false,
+    };
+    if (data) {
+      try {
+        await this.publicClient.call({
+          account: this.account.address,
+          to: this.walletAddress,
+          data,
+          gas: receipt.gasUsed * 2n,
+          blockNumber: receipt.blockNumber > 0n ? receipt.blockNumber - 1n : receipt.blockNumber,
+        });
+      } catch (e) {
+        decoded = decodeRevert(e);
+      }
+    }
+    return fail(action, decoded, this.ctx(), hash);
   }
 
   /** `executeAsAgent` calldata for a prepared batch, with the source tag when enabled. */
@@ -641,7 +880,7 @@ export class BvccAgentClient {
   swapExactInputV3(
     params: Parameters<BvccAgentClient["buildSwapExactInputV3"]>[0],
   ): Promise<ActionResult> {
-    return this.run("swapV3", this.buildSwapExactInputV3(params));
+    return this.runBuilt("swapV3", () => this.buildSwapExactInputV3(params));
   }
 
   // ------------------------------------------------------------------
@@ -1529,11 +1768,36 @@ export class BvccAgentClient {
    */
   async run(action: ActionName, executions: Execution[]): Promise<ActionResult> {
     try {
-      const txHash = await this.execute(executions);
-      return ok(action, txHash, this.ctx());
+      return await this.queued(async () => {
+        const hash = await this.executeNow(executions);
+        return this.confirm(action, hash, this.lastCalldata);
+      });
+    } catch (e) {
+      const txHash = e instanceof SubmissionError ? e.txHash : undefined;
+      return fail(action, decodeRevert(e), this.ctx(), txHash);
+    }
+  }
+
+  /** {@link run}, but a builder that refuses its input becomes a failed result too. */
+  private async runBuilt(action: ActionName, build: () => Execution[]): Promise<ActionResult> {
+    let executions: Execution[];
+    try {
+      executions = build();
     } catch (e) {
       return fail(action, decodeRevert(e), this.ctx());
     }
+    return this.run(action, executions);
+  }
+
+  /** {@link dryRun}, but a builder that refuses its input becomes a failed result too. */
+  private async dryRunBuilt(action: ActionName, build: () => Execution[]): Promise<DryRunResult> {
+    let executions: Execution[];
+    try {
+      executions = build();
+    } catch (e) {
+      return { ok: false, action, estimatedGas: null, estimatedNetworkFeeWei: null, preview: [], failure: decodeRevert(e) };
+    }
+    return this.dryRun(action, executions);
   }
 
   /** Decode any thrown/revert value into a human-readable explanation. */
@@ -1611,10 +1875,12 @@ export class BvccAgentClient {
     return this.dryRun("approve", [this.buildApprove(token, spender, amount)]);
   }
   dryRunSwapV3(params: Parameters<BvccAgentClient["buildSwapExactInputV3"]>[0]): Promise<DryRunResult> {
-    return this.dryRun("swapV3", this.buildSwapExactInputV3(params));
+    return this.dryRunBuilt("swapV3", () => this.buildSwapExactInputV3(params));
   }
-  dryRunSwapV4(params: Parameters<BvccAgentClient["buildSwapV4ExactIn"]>[0]): Promise<DryRunResult> {
-    return this.dryRun("swapV4", this.buildSwapV4ExactIn(params));
+  async dryRunSwapV4(params: Parameters<BvccAgentClient["buildSwapV4ExactIn"]>[0]): Promise<DryRunResult> {
+    const refused = await this.v5NativeOutRefusal(params.nativeOut);
+    if (refused) return { ok: false, action: "swapV4", estimatedGas: null, estimatedNetworkFeeWei: null, preview: [], failure: refused.bvccDecoded };
+    return this.dryRunBuilt("swapV4", () => this.buildSwapV4ExactIn(params));
   }
 
   // ------------------------------------------------------------------
@@ -1732,7 +1998,7 @@ export class BvccAgentClient {
     describe("the Uniswap v4 PositionManager", "addLiquidityV4", pm, "0xdd46508f", rPm);
     describe("the Aave Pool", "aaveSupply", aave, "0x617ba037", rAave);
     describe("the Uniswap v3 position manager", "addLiquidityV3", nfpm, "0x88316456", rV3);
-    describe("the wrapped native token", "swapFromNative", weth, "0xd0e30db0", rWrap);
+    describe("the wrapped native token", "wrapNative", weth, "0xd0e30db0", rWrap);
     if (missingPolicies.length > 0)
       notes.push("Some call policies are missing for this agent. The owner adds them by editing the agent in the dashboard.");
 
@@ -2021,6 +2287,7 @@ export class BvccAgentClient {
   }): Promise<SwapPlan> {
     const tokenIn = resolveToken(this.network.chainId, params.tokenIn).address;
     const tokenOut = resolveToken(this.network.chainId, params.tokenOut).address;
+    if (isSameSwapToken(tokenIn, tokenOut, this.network.weth)) throw new SameTokenSwapError();
     const fee = params.fee ?? 3000;
     const tickSpacing = params.protocol === "v4" ? (params.tickSpacing ?? 60) : null;
     const warnings: string[] = [];

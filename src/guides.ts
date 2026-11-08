@@ -88,6 +88,7 @@ export const GUIDES: readonly Guide[] = [
       "Simulate: dryRunSwapV3 or dryRunSwapV4 to check gas and any revert before sending.",
       "Swap: swapV3 (SwapRouter02) or swapV4 (Universal Router + Permit2). v4 pools are keyed by (fee, tickSpacing) — pass tickSpacing, e.g. 500/10 for USDC/WETH 0.05%.",
       "Native ETH: swapToNative (token → ETH) and swapFromNative (ETH → token); or swapV4 with nativeOut to receive ETH from a v4 native pool.",
+      "ETH ↔ WETH is not a swap: use wrapNative (ETH → WETH) and unwrapNative (WETH → ETH), one to one, with dryRunWrapNative / dryRunUnwrapNative to check first.",
     ],
     gotchas: [
       "Wallet V5: swaps run only through the Universal Router (SwapRouter02-style swaps are routed there automatically), between ERC-20 tokens. Swaps to or from the native coin work only where wrapping is active for the agent (getCapabilities \u2192 canWrapNative); otherwise use WETH. The Permit2 allowance is the owner's: if a swap reports a missing or expired allowance, ask the owner to renew the agent.",
@@ -95,6 +96,7 @@ export const GUIDES: readonly Guide[] = [
       "The per-token per-tx limit is consumed by the approve cap / amountInMaximum, not by what is actually spent — leave headroom for the cap.",
       "swapV4 needs BOTH the Universal Router and Permit2 in allowedProtocols, and tokenIn in allowedTokens.",
       "Output always returns to the wallet; a swap cannot deliver to another address.",
+      "A single-hop swap from a token to itself (ETH counts as WETH) is refused before any gas: there is no pool for it. Wrap or unwrap instead.",
     ],
     tools: [
       "buildSwapPlan",
@@ -106,6 +108,10 @@ export const GUIDES: readonly Guide[] = [
       "swapV4",
       "swapToNative",
       "swapFromNative",
+      "wrapNative",
+      "unwrapNative",
+      "dryRunWrapNative",
+      "dryRunUnwrapNative",
     ],
     seeAlso: ["getting-started", "liquidity"],
   },
